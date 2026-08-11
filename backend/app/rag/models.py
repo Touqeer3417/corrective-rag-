@@ -47,8 +47,10 @@ class GroqProvider(LLMProvider):
     def __init__(self):
         try:
             from groq import Groq
-            self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            self.model = get_settings().llm_model
+
+            settings = get_settings()  # <-- FIX: settings lo pehle
+            self.client = Groq(api_key=settings.groq_api_key)  # <-- FIX: os.environ ki jagah settings.groq_api_key
+            self.model = settings.llm_model
             logger.info(f"Groq provider initialized with model: {self.model}")
         except Exception as e:
             logger.error(f"Failed to initialize Groq: {e}")
@@ -121,7 +123,8 @@ class LocalProvider(LLMProvider):
 
     def __init__(self):
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # <-- FIX: pipeline import add kiya
+
             settings = get_settings()
             logger.info(f"Loading local model: {settings.local_llm_model}")
 

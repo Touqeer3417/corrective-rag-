@@ -1,17 +1,30 @@
 """Application configuration using Pydantic Settings."""
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# ---------------------------------------------------------------------------
+# Robust .env path resolution
+# ---------------------------------------------------------------------------
+# This file lives at: backend/app/config.py
+# The .env file lives at: backend/.env
+# We walk up one directory so it works no matter where the script is run from.
+BASE_DIR = Path(__file__).resolve().parent.parent          # -> backend/
+ENV_FILE = BASE_DIR / ".env"
 
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,          # Allow both field name & alias
     )
 
     # App
@@ -87,6 +100,9 @@ class Settings(BaseSettings):
             return [ext.strip().lower() for ext in v.split(",")]
         return v
 
+    # -----------------------------------------------------------------------
+    # Helper properties
+    # -----------------------------------------------------------------------
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024

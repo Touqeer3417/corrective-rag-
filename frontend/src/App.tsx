@@ -21,9 +21,7 @@ export default function App() {
           <NavLink to="/documents" icon={<FileText size={18} />}>Documents</NavLink>
           <NavLink to="/chat" icon={<MessageSquare size={18} />}>Chat</NavLink>
         </nav>
-        <div className="p-4 border-t border-gray-200 text-xs text-gray-500">
-          v1.0.0 • CRAG System
-        </div>
+     
       </aside>
       <main className="flex-1 p-8 overflow-auto">
         <Routes>

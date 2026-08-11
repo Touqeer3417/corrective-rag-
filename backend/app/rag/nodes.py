@@ -174,7 +174,8 @@ class RAGNodes:
                 docs, key=lambda x: x.score or 0.0, reverse=True
             )[:settings.top_k_rerank]
 
-        logger.info(f"[RERANKER] Top score: {state['reranked_documents'][0].score:.3f if state['reranked_documents'] else 0}")
+        top_score = state['reranked_documents'][0].score if state['reranked_documents'] else 0
+        logger.info(f"[RERANKER] Top score: {top_score:.3f}")
         return state
 
     def generate_answer(self, state: RAGState) -> RAGState:
