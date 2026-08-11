@@ -1,55 +1,97 @@
-import { Citation } from '../types/document';
+import axios from 'axios';
 
-export async function sendMessage(question: string) {
-  const res = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'}/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question }),
-  });
-  return res.json();
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
+
+export const api = axios.create({
+  baseURL: API_URL,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+export interface Citation {
+  citation_id: string;
+  document_name: string;
+  page_number?: number;
+  score: number;
+  text: string;
 }
 
-export function streamMessage(
+export const streamMessage = (
   question: string,
   onToken: (token: string) => void,
-  onCitation: (c: Citation) => void,
+  onCitation: (citation: Citation) => void,
   onDone: () => void,
-  onMetadata?: (m: any) => void,
-) {
-  const controller = new AbortController();
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
-
-  fetch(`${apiUrl}/chat/stream`, {
+  onMetadata: (metadata: any) => void
+): (() => void) => {
+  const abortController = new AbortController();
+  
+  fetch(`${API_URL}/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),
-    signal: controller.signal,
+    signal: abortController.signal,
   }).then(async (response) => {
-    const reader = response.body?.getReader();
-    if (!reader) return;
+    if (!response.body) {
+      onDone();
+      return;
+    }
+    
+    const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6));
-            if (data.type === 'token') onToken(data.content || '');
-            if (data.type === 'citation') onCitation(data.data);
-            if (data.type === 'metadata') onMetadata?.(data.data);
-            if (data.type === 'done') onDone();
-          } catch (e) {}
+    
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        
+        for (const line of lines) {
+          if (line.trim().startsWith('data: ')) {
+            const dataStr = line.trim().slice(6);
+            if (dataStr === '[DONE]') continue;
+            
+            try {
+              const parsed = JSON.parse(dataStr);
+              
+              if (parsed.type === 'token') {
+                onToken(parsed.content);
+              } else if (parsed.type === 'citation') {
+                onCitation(parsed.data);
+              } else if (parsed.type === 'metadata') {
+                onMetadata(parsed.data);
+              } else if (parsed.type === 'done') {
+                onDone();
+              }
+            } catch (e) {
+              // Ignore malformed JSON
+            }
+          }
         }
       }
+      
+      // Process remaining buffer
+      if (buffer.trim().startsWith('data: ')) {
+        const dataStr = buffer.trim().slice(6);
+        try {
+          const parsed = JSON.parse(dataStr);
+          if (parsed.type === 'token') onToken(parsed.content);
+          else if (parsed.type === 'citation') onCitation(parsed.data);
+          else if (parsed.type === 'metadata') onMetadata(parsed.data);
+          else if (parsed.type === 'done') onDone();
+        } catch (e) {}
+      }
+    } catch (err) {
+      console.error('Stream error:', err);
+    } finally {
+      onDone();
     }
-  }).catch(() => onDone());
-
-  return () => controller.abort();
-}
+  }).catch((err) => {
+    console.error('Fetch error:', err);
+    onDone();
+  });
+  
+  return () => abortController.abort();
+};

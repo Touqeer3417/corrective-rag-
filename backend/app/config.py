@@ -10,10 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ---------------------------------------------------------------------------
 # Robust .env path resolution
 # ---------------------------------------------------------------------------
-# This file lives at: backend/app/config.py
-# The .env file lives at: backend/.env
-# We walk up one directory so it works no matter where the script is run from.
-BASE_DIR = Path(__file__).resolve().parent.parent          # -> backend/
+BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 
 # ---------------------------------------------------------------------------
@@ -24,7 +21,7 @@ class Settings(BaseSettings):
         env_file=str(ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
-        populate_by_name=True,          # Allow both field name & alias
+        populate_by_name=True,
     )
 
     # App
@@ -45,18 +42,53 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in v.split(",")]
         return v
 
-    # LLM
+    # -----------------------------------------------------------------------
+    # LLM Provider (openai / groq / local)
+    # -----------------------------------------------------------------------
+    llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
+    llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    llm_temperature: float = Field(default=0.5, alias="LLM_TEMPERATURE")
+    llm_max_tokens: int = Field(default=2048, alias="LLM_MAX_TOKENS")
+
+    @field_validator("llm_provider")
+    @classmethod
+    def validate_llm_provider(cls, v: str) -> str:
+        allowed = {"openai", "groq", "local"}
+        if v.lower() not in allowed:
+            raise ValueError(f"llm_provider must be one of {allowed}, got '{v}'")
+        return v.lower()
+
+    # OpenAI (shared key for embeddings + LLM)
+    openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
+    openai_llm_model: str = Field(default="gpt-4o-mini", alias="OPENAI_LLM_MODEL")
+
+    # Groq
     groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
-    llm_model: str = Field(default="llama-3.1-70b-versatile", alias="LLM_MODEL")
-    llm_provider: str = Field(default="groq", alias="LLM_PROVIDER")
+    groq_model: str = Field(default="llama-3.1-70b-versatile", alias="GROQ_MODEL")
+
+    # Local LLM (fallback)
     local_llm_model: str = Field(
         default="microsoft/Phi-3-mini-4k-instruct", alias="LOCAL_LLM_MODEL"
     )
 
-    # Embeddings
+    # -----------------------------------------------------------------------
+    # Embeddings (OpenAI + Local fallback)
+    # -----------------------------------------------------------------------
+    embedding_provider: str = Field(default="openai", alias="EMBEDDING_PROVIDER")
+    openai_embedding_model: str = Field(
+        default="text-embedding-3-small", alias="OPENAI_EMBEDDING_MODEL"
+    )
     embedding_model: str = Field(default="BAAI/bge-small-en-v1.5", alias="EMBEDDING_MODEL")
     embedding_device: str = Field(default="cpu", alias="EMBEDDING_DEVICE")
     embedding_batch_size: int = Field(default=32, alias="EMBEDDING_BATCH_SIZE")
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, v: str) -> str:
+        allowed = {"openai", "local", "huggingface"}
+        if v.lower() not in allowed:
+            raise ValueError(f"embedding_provider must be one of {allowed}, got '{v}'")
+        return v.lower()
 
     # Reranker
     reranker_model: str = Field(default="BAAI/bge-reranker-base", alias="RERANKER_MODEL")
@@ -87,7 +119,7 @@ class Settings(BaseSettings):
     rrf_k: int = Field(default=60, alias="RRF_K")
     relevance_threshold_high: float = Field(default=0.7, alias="RELEVANCE_THRESHOLD_HIGH")
     relevance_threshold_low: float = Field(default=0.4, alias="RELEVANCE_THRESHOLD_LOW")
-    chunk_size: int = Field(default=512, alias="CHUNK_SIZE")
+    chunk_size: int = Field(default=350, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
 
     # Security
@@ -110,6 +142,33 @@ class Settings(BaseSettings):
     @property
     def max_batch_size_bytes(self) -> int:
         return self.max_batch_size_mb * 1024 * 1024
+
+    @property
+    def embedding_dimensions(self) -> int:
+        """Return expected vector dimensions based on the active embedding provider."""
+        dims_map = {
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+            "text-embedding-ada-002": 1536,
+        }
+        if self.embedding_provider == "openai":
+            return dims_map.get(self.openai_embedding_model, 1536)
+        if "small" in self.embedding_model:
+            return 384
+        if "base" in self.embedding_model:
+            return 768
+        if "large" in self.embedding_model:
+            return 1024
+        return 384
+
+    @property
+    def active_llm_model(self) -> str:
+        """Return the active LLM model name based on provider."""
+        if self.llm_provider == "openai":
+            return self.openai_llm_model
+        if self.llm_provider == "groq":
+            return self.groq_model
+        return self.local_llm_model
 
 
 @lru_cache()

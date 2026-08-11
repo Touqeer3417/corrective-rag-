@@ -1,9 +1,7 @@
-"""LLM provider wrappers: Groq primary, local fallback."""
-import json
-import os
+"""LLM provider abstraction — OpenAI, Groq, and Local support."""
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, Optional
 
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -11,8 +9,11 @@ from app.core.logging import get_logger
 logger = get_logger("rag.models")
 
 
-class LLMProvider(ABC):
-    """Abstract base class for LLM providers."""
+# ---------------------------------------------------------------------------
+# Abstract Base
+# ---------------------------------------------------------------------------
+class BaseLLMProvider(ABC):
+    """Abstract LLM provider with generate + stream support."""
 
     @abstractmethod
     def generate(
@@ -20,14 +21,11 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
         json_mode: bool = False,
     ) -> Dict[str, Any]:
-        """Generate a completion.
-
-        Returns dict with: text, model, tokens_used, latency_ms
-        """
-        pass
+        """Generate a completion. Returns dict with text, model, tokens_used, latency_ms."""
+        ...
 
     @abstractmethod
     def generate_stream(
@@ -35,37 +33,44 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
-    ):
-        """Generate a streaming completion. Yields text chunks."""
-        pass
+        max_tokens: int = 2048,
+    ) -> Generator[str, None, None]:
+        """Yield tokens as they are generated."""
+        ...
 
 
-class GroqProvider(LLMProvider):
-    """Groq API provider (primary)."""
+# ---------------------------------------------------------------------------
+# OpenAI Provider
+# ---------------------------------------------------------------------------
+class OpenAILLMProvider(BaseLLMProvider):
+    """OpenAI GPT-4o / GPT-4o-mini provider."""
 
     def __init__(self):
         try:
-            from groq import Groq
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("OpenAI package not installed. Run: pip install openai")
 
-            settings = get_settings()  # <-- FIX: settings lo pehle
-            self.client = Groq(api_key=settings.groq_api_key)  # <-- FIX: os.environ ki jagah settings.groq_api_key
-            self.model = settings.llm_model
-            logger.info(f"Groq provider initialized with model: {self.model}")
-        except Exception as e:
-            logger.error(f"Failed to initialize Groq: {e}")
-            raise
+        settings = get_settings()
+        if not settings.openai_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required when LLM_PROVIDER=openai. "
+                "Add it to backend/.env"
+            )
+
+        self.client = OpenAI(api_key=settings.openai_api_key)
+        self.model = settings.openai_llm_model
+        logger.info(f"OpenAI LLM client ready. Model: {self.model}")
 
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
         json_mode: bool = False,
     ) -> Dict[str, Any]:
         start = time.time()
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -80,96 +85,202 @@ class GroqProvider(LLMProvider):
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            latency = int((time.time() - start) * 1000)
+            text = response.choices[0].message.content or ""
+            usage = response.usage
 
-        latency = (time.time() - start) * 1000
-        text = response.choices[0].message.content or ""
-
-        return {
-            "text": text,
-            "model": self.model,
-            "tokens_used": response.usage.total_tokens if response.usage else 0,
-            "latency_ms": latency,
-        }
+            return {
+                "text": text,
+                "model": self.model,
+                "tokens_used": usage.total_tokens if usage else 0,
+                "latency_ms": latency,
+            }
+        except Exception as e:
+            logger.error(f"OpenAI generation failed: {e}")
+            raise
 
     def generate_stream(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
-    ):
+        max_tokens: int = 2048,
+    ) -> Generator[str, None, None]:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            logger.error(f"OpenAI streaming failed: {e}")
+            raise
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
 
-
-class LocalProvider(LLMProvider):
-    """Local HuggingFace transformers provider (fallback)."""
+# ---------------------------------------------------------------------------
+# Groq Provider
+# ---------------------------------------------------------------------------
+class GroqLLMProvider(BaseLLMProvider):
+    """Groq API provider (Llama, Mixtral, etc.)."""
 
     def __init__(self):
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # <-- FIX: pipeline import add kiya
+            from groq import Groq
+        except ImportError:
+            raise ImportError("Groq package not installed. Run: pip install groq")
 
-            settings = get_settings()
-            logger.info(f"Loading local model: {settings.local_llm_model}")
+        settings = get_settings()
+        if not settings.groq_api_key:
+            raise ValueError(
+                "GROQ_API_KEY is required when LLM_PROVIDER=groq. "
+                "Add it to backend/.env"
+            )
 
-            self.tokenizer = AutoTokenizer.from_pretrained(settings.local_llm_model)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                settings.local_llm_model,
-                device_map="auto",
-                torch_dtype="auto",
-            )
-            self.pipe = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                max_new_tokens=512,
-                temperature=0.1,
-                do_sample=True,
-            )
-            self.model_name = settings.local_llm_model
-            logger.info("Local provider initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize local model: {e}")
-            raise
+        self.client = Groq(api_key=settings.groq_api_key)
+        self.model = settings.groq_model
+        logger.info(f"Groq LLM client ready. Model: {self.model}")
 
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
         json_mode: bool = False,
     ) -> Dict[str, Any]:
         start = time.time()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        # Format prompt for instruction-following models
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            latency = int((time.time() - start) * 1000)
+            text = response.choices[0].message.content or ""
+            usage = response.usage
+
+            return {
+                "text": text,
+                "model": self.model,
+                "tokens_used": usage.total_tokens if usage else 0,
+                "latency_ms": latency,
+            }
+        except Exception as e:
+            logger.error(f"Groq generation failed: {e}")
+            raise
+
+    def generate_stream(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 2048,
+    ) -> Generator[str, None, None]:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as e:
+            logger.error(f"Groq streaming failed: {e}")
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Local Provider (HuggingFace Transformers)
+# ---------------------------------------------------------------------------
+class LocalLLMProvider(BaseLLMProvider):
+    """Local HuggingFace model provider (CPU/GPU)."""
+
+    def __init__(self):
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        except ImportError:
+            raise ImportError(
+                "transformers not installed. Run: pip install transformers accelerate"
+            )
+
+        settings = get_settings()
+        model_name = settings.local_llm_model
+        logger.info(f"Loading local LLM: {model_name}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype="auto",
+            device_map="auto",
+        )
+        self.pipeline = pipeline(
+            "text-generation",
+            model=self.model,
+            tokenizer=self.tokenizer,
+        )
+        logger.info("Local LLM loaded successfully")
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 2048,
+        json_mode: bool = False,
+    ) -> Dict[str, Any]:
+        start = time.time()
         prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>\n"
 
-        result = self.pipe(prompt, max_new_tokens=max_tokens, temperature=temperature)
-        text = result[0]["generated_text"].split("<|assistant|>")[-1].strip()
+        outputs = self.pipeline(
+            prompt,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=temperature > 0,
+            return_full_text=False,
+        )
+        latency = int((time.time() - start) * 1000)
+        text = outputs[0]["generated_text"].strip()
 
-        latency = (time.time() - start) * 1000
+        # Rough token count
+        tokens_used = len(self.tokenizer.encode(prompt + text))
 
         return {
             "text": text,
-            "model": self.model_name,
-            "tokens_used": len(self.tokenizer.encode(text)),
+            "model": self.model.config.name_or_path,
+            "tokens_used": tokens_used,
             "latency_ms": latency,
         }
 
@@ -178,38 +289,35 @@ class LocalProvider(LLMProvider):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.1,
-        max_tokens: int = 1024,
-    ):
-        # Local models don't stream efficiently; yield full response
+        max_tokens: int = 2048,
+    ) -> Generator[str, None, None]:
+        # Local models typically don't stream easily with transformers pipeline
+        # Fallback: generate full then yield word-by-word
         result = self.generate(system_prompt, user_prompt, temperature, max_tokens)
-        yield result["text"]
+        words = result["text"].split(" ")
+        for word in words:
+            yield word + " "
 
 
-# Provider factory
-_llm_provider: Optional[LLMProvider] = None
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+_llm_instance: Optional[BaseLLMProvider] = None
 
 
-def get_llm_provider() -> LLMProvider:
-    """Get LLM provider with fallback logic."""
-    global _llm_provider
-    if _llm_provider is None:
+def get_llm_provider() -> BaseLLMProvider:
+    global _llm_instance
+    if _llm_instance is None:
         settings = get_settings()
+        provider = settings.llm_provider
 
-        # Try Groq first if configured
-        if settings.llm_provider == "groq" and settings.groq_api_key:
-            try:
-                _llm_provider = GroqProvider()
-                logger.info("Using Groq as primary LLM provider")
-                return _llm_provider
-            except Exception as e:
-                logger.warning(f"Groq unavailable, falling back to local: {e}")
+        if provider == "openai":
+            _llm_instance = OpenAILLMProvider()
+        elif provider == "groq":
+            _llm_instance = GroqLLMProvider()
+        elif provider == "local":
+            _llm_instance = LocalLLMProvider()
+        else:
+            raise ValueError(f"Unknown LLM provider: {provider}")
 
-        # Fallback to local
-        try:
-            _llm_provider = LocalProvider()
-            logger.info("Using local HuggingFace model as fallback")
-        except Exception as e:
-            logger.error(f"No LLM provider available: {e}")
-            raise RuntimeError("No LLM provider available. Check GROQ_API_KEY or local model setup.")
-
-    return _llm_provider
+    return _llm_instance

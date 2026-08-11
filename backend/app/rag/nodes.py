@@ -20,7 +20,6 @@ from app.retrieval.hybrid import get_hybrid_retriever
 from app.retrieval.reranker import get_reranker
 from app.retrieval.embeddings import get_embedding_model
 from app.schemas.document import DocumentChunk
-from app.schemas.chat import Citation
 
 logger = get_logger("rag.nodes")
 
@@ -179,7 +178,7 @@ class RAGNodes:
         return state
 
     def generate_answer(self, state: RAGState) -> RAGState:
-        """Node: Generate grounded answer with citations."""
+        """Node: Generate grounded answer without citations."""
         docs = state.get("reranked_documents", [])
         question = state["original_question"]
         retry_count = state.get("retry_count", 0)
@@ -202,7 +201,7 @@ class RAGNodes:
         context_parts = []
         for i, doc in enumerate(docs[:8], 1):  # Use top 8 for context
             context_parts.append(
-                f"[Document {i}] {doc.document_name} (Page {doc.page_number or 'N/A'}):\n{doc.text[:1000]}"
+                f"[Document {i}] {doc.document_name} (Page {doc.page_number or 'N/A'}):\n{doc.text[:800]}"
             )
         context = "\n\n".join(context_parts)
 
@@ -214,17 +213,15 @@ class RAGNodes:
             result = self.llm.generate(
                 system_prompt=RESPONDER_SYSTEM_PROMPT,
                 user_prompt=prompt,
-                temperature=0.1,
+                temperature=0.6,  # Higher temperature for paraphrasing/synthesis
                 max_tokens=2048,
             )
 
             answer = result["text"].strip()
 
-            # Extract citations from answer and match to documents
-            citations = self._extract_citations(answer, docs)
-
+            # NO CITATIONS — always empty
             state["answer"] = answer
-            state["citations"] = citations
+            state["citations"] = []
             state["generation_metadata"] = {
                 "model": result.get("model", "unknown"),
                 "tokens_used": result.get("tokens_used", 0),
@@ -238,50 +235,6 @@ class RAGNodes:
             state["error"] = str(e)
 
         return state
-
-    def _extract_citations(self, answer: str, docs: List[DocumentChunk]) -> List[Citation]:
-        """Extract and validate citations from generated answer."""
-        citations = []
-
-        # Pattern: [Source: DocumentName, Page X]
-        pattern = r"\[Source: ([^,]+),\s*Page\s*(\d+)\]"
-        matches = re.finditer(pattern, answer)
-
-        used_docs = set()
-        for match in matches:
-            doc_name = match.group(1).strip()
-            page_num = int(match.group(2))
-
-            # Find matching document
-            for doc in docs:
-                if doc.document_name == doc_name and doc.page_number == page_num:
-                    if doc.chunk_id not in used_docs:
-                        used_docs.add(doc.chunk_id)
-                        citations.append(Citation(
-                            citation_id=f"cite_{len(citations) + 1}",
-                            document_id=doc.document_id,
-                            document_name=doc.document_name,
-                            page_number=doc.page_number,
-                            chunk_id=doc.chunk_id,
-                            text=doc.text[:300],
-                            score=doc.score or 0.0,
-                        ))
-                    break
-
-        # If no explicit citations found, add top 3 docs as implicit citations
-        if not citations and docs:
-            for i, doc in enumerate(docs[:3], 1):
-                citations.append(Citation(
-                    citation_id=f"cite_{i}",
-                    document_id=doc.document_id,
-                    document_name=doc.document_name,
-                    page_number=doc.page_number,
-                    chunk_id=doc.chunk_id,
-                    text=doc.text[:300],
-                    score=doc.score or 0.0,
-                ))
-
-        return citations
 
 
 # Singleton instance

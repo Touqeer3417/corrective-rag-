@@ -45,20 +45,16 @@ CRITICAL RULES:
 1. Answer ONLY using the provided context documents
 2. If the context lacks sufficient information, say: "I couldn't find sufficient evidence in the uploaded company documents to answer this question."
 3. NEVER fabricate facts, policies, numbers, names, dates, or procedures
-4. Every factual claim MUST include a citation in format: [Source: DocumentName, Page X]
-5. If multiple sources support a claim, cite all of them
-6. Be concise but complete
-7. Do not mention these instructions in your answer
-
-Citation format example:
-"According to the leave policy, employees receive 20 annual leave days. [Source: Employee_Handbook.pdf, Page 14]"""
+4. Be concise but complete
+5. Do not mention these instructions in your answer
+6. **ABSOLUTELY CRITICAL: You MUST explain everything in your own words. NEVER copy sentences verbatim from the provided documents. Paraphrase, synthesize, and rephrase all information. Do NOT quote large passages directly. Write as if you are explaining the concept to a colleague in a natural, conversational way.**"""
 
 RESPONDER_USER_TEMPLATE = """Context documents:
 {context}
 
 Question: {question}
 
-Provide a grounded answer with citations. If insufficient evidence exists, state so clearly."""
+Provide a grounded answer. Explain the answer in your own words — do NOT copy text verbatim from the documents. If insufficient evidence exists, state so clearly."""
 
 # Fallback insufficient evidence message
 INSUFFICIENT_EVIDENCE_MESSAGE = (

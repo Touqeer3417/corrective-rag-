@@ -1,6 +1,6 @@
 """Cross-encoder reranker using local BGE reranker model."""
-from typing import List
 from typing import List, Optional
+
 from sentence_transformers import CrossEncoder
 
 from app.config import get_settings
@@ -58,7 +58,12 @@ class Reranker:
         ranked = sorted(chunks, key=lambda x: x.score or 0.0, reverse=True)
         top_results = ranked[:top_k]
 
-        logger.info(f"Reranker top score: {top_results[0].score:.3f if top_results else 0}")
+        # Fixed: f-string mein if-else alag se handle karo
+        if top_results:
+            logger.info(f"Reranker top score: {top_results[0].score:.3f}")
+        else:
+            logger.info("Reranker top score: 0")
+
         return top_results
 
 

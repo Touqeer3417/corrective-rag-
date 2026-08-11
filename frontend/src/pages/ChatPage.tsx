@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Send, Loader2, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
 import { streamMessage } from '../services/chat';
-import { Citation } from '../types/document';
+import { Citation } from '../services/chat';
 
 export default function ChatPage() {
   const [question, setQuestion] = useState('');
@@ -39,6 +39,9 @@ export default function ChatPage() {
     setExpandedCitation((prev) => (prev === id ? null : id));
   };
 
+  // Sirf 1 citation dikhana - sab se relevant wali
+  const topCitation = citations[0] || null;
+
   return (
     <div className="max-w-4xl mx-auto h-[calc(100vh-4rem)] flex flex-col">
       <h2 className="text-2xl font-bold text-gray-900 mb-6">Document Search</h2>
@@ -53,49 +56,57 @@ export default function ChatPage() {
           </div>
         )}
         
-        {/* ANSWER TEXT - YEH MAIN AREA HAI */}
+        {/* ===== PEHLE ANSWER ===== */}
         {answer && (
-          <div className="mb-6">
-            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-2">Answer</h3>
-            <div className="whitespace-pre-wrap text-gray-800 leading-relaxed text-base">{answer}</div>
-          </div>
-        )}
-
-        {/* SOURCES SECTION */}
-        {citations.length > 0 && (
-          <div className="mt-4 pt-4 border-t border-gray-200">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">Sources</h4>
-            <div className="space-y-2">
-              {citations.map((c) => (
-                <div key={c.citation_id} className="border border-gray-200 rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => toggleCitation(c.citation_id)}
-                    className="w-full flex items-center justify-between px-4 py-2.5 bg-blue-50 hover:bg-blue-100 transition-colors text-left"
-                  >
-                    <span className="text-sm font-medium text-blue-800">
-                      {c.document_name}, Page {c.page_number || 'N/A'}
-                    </span>
-                    {expandedCitation === c.citation_id ? (
-                      <ChevronUp size={16} className="text-blue-600" />
-                    ) : (
-                      <ChevronDown size={16} className="text-blue-600" />
-                    )}
-                  </button>
-                  
-                  {/* EXPANDED CONTENT - YEH SCREEN PE DIKHEGA */}
-                  {expandedCitation === c.citation_id && (
-                    <div className="px-4 py-3 bg-gray-50 text-sm text-gray-700 leading-relaxed border-t border-gray-200">
-                      <p className="font-medium text-gray-500 text-xs mb-1">Relevance Score: {(c.score * 100).toFixed(1)}%</p>
-                      <p>{c.text}</p>
-                    </div>
-                  )}
-                </div>
-              ))}
+          <div className="mb-6 bg-white rounded-lg">
+            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">
+              Answer
+            </h3>
+            <div className="whitespace-pre-wrap text-gray-800 leading-relaxed text-base p-1">
+              {answer}
             </div>
           </div>
         )}
 
-        {/* QUERY REWRITE INFO */}
+        {/* ===== PHIR SOURCE (SIRF 1) ===== */}
+        {topCitation && (
+          <div className="mt-2 pt-4 border-t border-gray-200">
+            <h4 className="text-sm font-semibold text-gray-700 mb-3 flex items-center gap-2">
+              <BookOpen size={16} />
+              Source
+            </h4>
+            
+            <div className="border border-gray-200 rounded-lg overflow-hidden">
+              <button
+                onClick={() => toggleCitation(topCitation.citation_id)}
+                className="w-full flex items-center justify-between px-4 py-3 bg-blue-50 hover:bg-blue-100 transition-colors text-left"
+              >
+                <span className="text-sm font-medium text-blue-800">
+                  {topCitation.document_name}, Page {topCitation.page_number || 'N/A'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full">
+                    {(topCitation.score * 100).toFixed(1)}% match
+                  </span>
+                  {expandedCitation === topCitation.citation_id ? (
+                    <ChevronUp size={16} className="text-blue-600" />
+                  ) : (
+                    <ChevronDown size={16} className="text-blue-600" />
+                  )}
+                </div>
+              </button>
+              
+              {/* Source text - click karne pe dikhega */}
+              {expandedCitation === topCitation.citation_id && (
+                <div className="px-4 py-3 bg-gray-50 text-sm text-gray-700 leading-relaxed border-t border-gray-200">
+                  <p>{topCitation.text}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Query rewrite info */}
         {metadata.transformed_query && (
           <p className="mt-3 text-xs text-gray-400 italic">
             Rewritten query: {metadata.transformed_query}
@@ -105,7 +116,7 @@ export default function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
-      {/* INPUT AREA */}
+      {/* Input Area */}
       <form onSubmit={handleSubmit} className="flex gap-3">
         <input
           value={question}
