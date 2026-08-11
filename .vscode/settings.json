@@ -1,4 +1,7 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+     "css.validate": false,
+    "scss.validate": false,
+    "less.validate": false
 }

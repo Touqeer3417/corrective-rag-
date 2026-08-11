@@ -44,6 +44,7 @@ export default function ChatPage() {
 
   return (
     <div className="max-w-4xl mx-auto h-[calc(100vh-4rem)] flex flex-col">
+      
       <h2 className="text-2xl font-bold text-gray-900 mb-6">Document Search</h2>
       
       <div className="flex-1 card mb-4 overflow-auto flex flex-col">

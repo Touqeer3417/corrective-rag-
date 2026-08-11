@@ -14,19 +14,23 @@ def route_after_retrieval(state: RAGState) -> Literal["grade_documents", "transf
     If retrieval returned documents, grade them.
     If empty, try query transformation directly.
     """
-    docs = state.get("documents", [])
-    if docs:
+    try:
+        docs = state.get("documents", [])
+        if docs:
+            return "grade_documents"
+
+        retry_count = state.get("retry_count", 0)
+        max_retries = state.get("max_retries", 2)
+
+        if retry_count < max_retries:
+            logger.info("[EDGE] No documents retrieved, routing to transform_query")
+            return "transform_query"
+
+        # Max retries reached, still route to grader (will fail gracefully)
         return "grade_documents"
-
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 2)
-
-    if retry_count < max_retries:
-        logger.info("[EDGE] No documents retrieved, routing to transform_query")
-        return "transform_query"
-
-    # Max retries reached, still route to grader (will fail gracefully)
-    return "grade_documents"
+    except Exception as e:
+        logger.error(f"[EDGE] route_after_retrieval crashed: {e}")
+        return "grade_documents"
 
 
 def decide_after_grading(state: RAGState) -> Literal["reranker", "transform_query", "responder"]:
@@ -37,28 +41,44 @@ def decide_after_grading(state: RAGState) -> Literal["reranker", "transform_quer
         - transform_query: Poor relevance, attempt corrective retrieval
         - responder: Max retries reached or insufficient evidence
     """
-    settings = get_settings()
-    retrieval_score = state.get("retrieval_score", 0.0) or 0.0
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", settings.max_retries)
-    graded_docs = state.get("graded_documents", [])
+    try:
+        # SAFE defaults — agar config mein missing ho toh bhi crash nahi hoga
+        retrieval_score = state.get("retrieval_score", 0.0) or 0.0
+        retry_count = state.get("retry_count", 0)
+        max_retries = state.get("max_retries", 2)
+        graded_docs = state.get("graded_documents", [])
 
-    logger.info(f"[EDGE] Grading decision: score={retrieval_score:.3f}, retry={retry_count}/{max_retries}")
+        # Thresholds with safe defaults
+        high_threshold = 0.6
+        low_threshold = 0.3
+        try:
+            settings = get_settings()
+            high_threshold = getattr(settings, "relevance_threshold_high", 0.6)
+            low_threshold = getattr(settings, "relevance_threshold_low", 0.3)
+            max_retries = state.get("max_retries", getattr(settings, "max_retries", 2))
+        except Exception as cfg_err:
+            logger.warning(f"[EDGE] Config read failed, using defaults: {cfg_err}")
 
-    # High relevance: proceed to rerank
-    if retrieval_score >= settings.relevance_threshold_high and graded_docs:
-        return "reranker"
+        logger.info(f"[EDGE] Grading decision: score={retrieval_score:.3f}, retry={retry_count}/{max_retries}")
 
-    # Low relevance but retries remaining: corrective path
-    if retrieval_score < settings.relevance_threshold_low and retry_count < max_retries:
-        logger.info(f"[EDGE] Low relevance ({retrieval_score:.3f}), routing to transform_query")
-        return "transform_query"
+        # High relevance: proceed to rerank
+        if retrieval_score >= high_threshold and graded_docs:
+            return "reranker"
 
-    # Marginal relevance or max retries: proceed with what we have
-    if graded_docs:
-        logger.info(f"[EDGE] Proceeding to reranker with {len(graded_docs)} docs")
-        return "reranker"
+        # Low relevance but retries remaining: corrective path
+        if retrieval_score < low_threshold and retry_count < max_retries:
+            logger.info(f"[EDGE] Low relevance ({retrieval_score:.3f}), routing to transform_query")
+            return "transform_query"
 
-    # No documents at all after max retries
-    logger.warning("[EDGE] No relevant documents after grading, routing to responder")
-    return "responder"
+        # Marginal relevance or max retries: proceed with what we have
+        if graded_docs:
+            logger.info(f"[EDGE] Proceeding to reranker with {len(graded_docs)} docs")
+            return "reranker"
+
+        # No documents at all after max retries
+        logger.warning("[EDGE] No relevant documents after grading, routing to responder")
+        return "responder"
+    except Exception as e:
+        logger.error(f"[EDGE] decide_after_grading crashed: {e}")
+        # Graceful fallback: responder par bhejo taake user ko kuch toh mile
+        return "responder"

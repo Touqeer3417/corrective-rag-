@@ -1,17 +1,12 @@
 """Chat and streaming endpoints."""
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 from app.dependencies import get_chat_svc
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.chat_service import ChatService
 
 router = APIRouter()
-
-
-class ChatBody(BaseModel):
-    question: str
 
 
 @router.post("", response_model=ChatResponse)
@@ -28,7 +23,7 @@ async def chat(
 
 @router.post("/stream")
 async def chat_stream(
-    body: ChatBody,
+    body: ChatRequest,  # Consistent: ChatRequest use karo, alag ChatBody nahi
     chat_service: ChatService = Depends(get_chat_svc),
 ):
     """Streaming chat endpoint via SSE."""
