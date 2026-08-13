@@ -1,10 +1,15 @@
-"""Pure Python in-memory vector store (no Qdrant needed)."""
-import json
-import os
-from pathlib import Path
+"""Qdrant vector store implementation."""
 from typing import Any, Dict, List, Optional
 
-import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
 
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -12,147 +17,125 @@ from app.schemas.document import DocumentChunk
 
 logger = get_logger("storage.vector")
 
-
 class VectorStore:
-    """In-memory vector store with numpy cosine similarity. No external DB needed."""
+    """Qdrant-backed vector store with ANN search."""
 
     def __init__(self):
-        settings = get_settings()
-        self.data_dir = Path(settings.bm25_index_path).parent / "vectors"
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.data_file = self.data_dir / "vectors.json"
-        self.meta_file = self.data_dir / "meta.json"
-
-        self.embeddings: List[Dict[str, Any]] = []
-        self._dimension: Optional[int] = None
-        self._load()
-
-    # ------------------------------------------------------------------
-    # Metadata helpers
-    # ------------------------------------------------------------------
-    def _load_meta(self) -> Optional[int]:
-        """Return stored dimension from meta file, or None."""
-        if self.meta_file.exists():
-            try:
-                with open(self.meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                return meta.get("dimension")
-            except Exception:
-                return None
-        return None
-
-    def _save_meta(self, dimension: int) -> None:
+        self.settings = get_settings()
         try:
-            with open(self.meta_file, "w", encoding="utf-8") as f:
-                json.dump({"dimension": dimension}, f)
+            self.client = QdrantClient(
+                host=self.settings.qdrant_host,
+                port=self.settings.qdrant_port,
+                api_key=self.settings.qdrant_api_key or None,
+            )
+            self.collection_name = self.settings.qdrant_collection
+            self._dimension: Optional[int] = None
+            self._init_collection()
         except Exception as e:
-            logger.error(f"Failed to save meta: {e}")
+            logger.error(f"Failed to connect to Qdrant: {e}")
+            raise
 
-    def _clear_store(self) -> None:
-        """Remove all stored vectors and metadata."""
-        self.embeddings = []
-        self._dimension = None
-        if self.data_file.exists():
-            self.data_file.unlink()
-        if self.meta_file.exists():
-            self.meta_file.unlink()
-        logger.warning("Vector store cleared due to dimension mismatch.")
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-    def _load(self) -> None:
-        if not self.data_file.exists():
-            self.embeddings = []
-            return
-
+    def _init_collection(self) -> None:
+        """Check existing collection and get dimension."""
         try:
-            with open(self.data_file, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-
-            self.embeddings = []
-            for item in raw:
-                item["embedding"] = np.array(item["embedding"], dtype=np.float32)
-                item["chunk"] = DocumentChunk(**item["chunk"])
-                self.embeddings.append(item)
-
-            # Validate dimension consistency
-            if self.embeddings:
-                stored_dim = self.embeddings[0]["embedding"].shape[0]
-                meta_dim = self._load_meta()
-
-                if meta_dim is not None and stored_dim != meta_dim:
-                    logger.warning(
-                        f"Stored dimension mismatch: file={stored_dim}, meta={meta_dim}. "
-                        f"Clearing store."
-                    )
-                    self._clear_store()
-                    return
-
-                self._dimension = stored_dim
-                self._save_meta(stored_dim)
-
-            logger.info(f"Loaded {len(self.embeddings)} vectors from disk (dim={self._dimension})")
+            collections = self.client.get_collections().collections
+            exists = any(c.name == self.collection_name for c in collections)
+            
+            if exists:
+                info = self.client.get_collection(self.collection_name)
+                self._dimension = info.config.params.vectors.size
+                logger.info(
+                    f"Connected to Qdrant collection '{self.collection_name}' "
+                    f"(dim={self._dimension})"
+                )
+            else:
+                logger.info(
+                    f"Qdrant collection '{self.collection_name}' not found. "
+                    f"Will create on first upsert."
+                )
         except Exception as e:
-            logger.warning(f"Could not load vectors: {e}")
-            self.embeddings = []
-            self._dimension = None
+            logger.warning(f"Could not check Qdrant collections: {e}")
 
-    def _save(self) -> None:
+    def _create_collection(self, dimension: int) -> None:
+        """Create collection with given dimension."""
         try:
-            serializable = []
-            for item in self.embeddings:
-                serializable.append({
-                    "embedding": item["embedding"].tolist(),
-                    "chunk": item["chunk"].model_dump(),
-                })
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(serializable, f, default=str)
-
-            if self._dimension is not None:
-                self._save_meta(self._dimension)
-
-            logger.info(f"Saved {len(self.embeddings)} vectors to disk")
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+            )
+            self._dimension = dimension
+            logger.info(
+                f"Created Qdrant collection '{self.collection_name}' "
+                f"with dimension {dimension}"
+            )
         except Exception as e:
-            logger.error(f"Failed to save vectors: {e}")
+            logger.error(f"Failed to create Qdrant collection: {e}")
+            raise
 
-    # ------------------------------------------------------------------
-    # Core operations
-    # ------------------------------------------------------------------
-    def upsert_chunks(self, chunks: List[DocumentChunk], embeddings: List[List[float]]) -> None:
+    def upsert_chunks(
+        self, chunks: List[DocumentChunk], embeddings: List[List[float]]
+    ) -> None:
         if not chunks or not embeddings:
             return
 
         if len(chunks) != len(embeddings):
             raise ValueError(
-                f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) must have same length"
+                f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) "
+                f"must have same length"
             )
 
-        # Detect dimension from first new embedding
-        new_dim = len(embeddings[0])
-
-        # If store has existing vectors with different dimension → clear
-        if self._dimension is not None and new_dim != self._dimension:
-            logger.warning(
-                f"Dimension mismatch: existing={self._dimension}, new={new_dim}. "
-                f"Clearing old vectors before upsert."
-            )
-            self._clear_store()
-
-        self._dimension = new_dim
-
-        for chunk, emb in zip(chunks, embeddings):
-            if len(emb) != new_dim:
-                raise ValueError(
-                    f"Inconsistent embedding dimension: expected {new_dim}, got {len(emb)}"
+        dimension = len(embeddings[0])
+        
+        try:
+            collections = self.client.get_collections().collections
+            exists = any(c.name == self.collection_name for c in collections)
+            
+            if not exists:
+                self._create_collection(dimension)
+            elif self._dimension is not None and dimension != self._dimension:
+                logger.warning(
+                    f"Dimension mismatch: existing={self._dimension}, new={dimension}. "
+                    f"Recreating collection."
                 )
-            self.embeddings.append({
-                "embedding": np.array(emb, dtype=np.float32),
-                "chunk": chunk,
-            })
+                self.client.delete_collection(self.collection_name)
+                self._create_collection(dimension)
 
-        self._save()
-        logger.info(f"Upserted {len(chunks)} vectors (dim={new_dim})")
+            self._dimension = dimension
+
+            points = []
+            for chunk, emb in zip(chunks, embeddings):
+                if len(emb) != dimension:
+                    raise ValueError(
+                        f"Inconsistent embedding dimension: expected {dimension}, "
+                        f"got {len(emb)}"
+                    )
+                
+                points.append(
+                    PointStruct(
+                        id=chunk.chunk_id,
+                        vector=emb,
+                        payload={
+                            "chunk_id": chunk.chunk_id,
+                            "document_id": chunk.document_id,
+                            "document_name": chunk.document_name,
+                            "file_type": chunk.file_type,
+                            "page_number": chunk.page_number,
+                            "section": chunk.section,
+                            "text": chunk.text,
+                            "metadata": chunk.metadata,
+                        },
+                    )
+                )
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
+            logger.info(f"Upserted {len(points)} vectors to Qdrant")
+        except Exception as e:
+            logger.error(f"Failed to upsert chunks to Qdrant: {e}")
+            raise
 
     def search(
         self,
@@ -160,61 +143,88 @@ class VectorStore:
         top_k: int = 50,
         document_ids: Optional[List[str]] = None,
     ) -> List[DocumentChunk]:
-        if not self.embeddings:
-            logger.warning("Vector store empty, returning no results")
-            return []
+        try:
+            collections = self.client.get_collections().collections
+            if not any(c.name == self.collection_name for c in collections):
+                logger.warning("Qdrant collection does not exist, returning no results")
+                return []
 
-        query = np.array(query_embedding, dtype=np.float32)
+            query_filter = None
+            if document_ids:
+                # "should" = OR logic: document_id matches any of the given ids
+                query_filter = Filter(
+                    should=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=doc_id),
+                        )
+                        for doc_id in document_ids
+                    ]
+                )
 
-        # Dimension guard
-        if self._dimension is not None and query.shape[0] != self._dimension:
-            logger.error(
-                f"Query dimension ({query.shape[0]}) does not match store dimension ({self._dimension}). "
-                f"Did you change the embedding model? Try clearing the vector store."
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_embedding,
+                limit=top_k,
+                query_filter=query_filter,
+                with_payload=True,
             )
+
+            chunks = []
+            for scored_point in results:
+                payload = scored_point.payload or {}
+                chunk = DocumentChunk(
+                    chunk_id=payload.get("chunk_id", scored_point.id),
+                    document_id=payload.get("document_id", ""),
+                    document_name=payload.get("document_name", ""),
+                    file_type=payload.get("file_type", ""),
+                    page_number=payload.get("page_number"),
+                    section=payload.get("section"),
+                    text=payload.get("text", ""),
+                    metadata=payload.get("metadata", {}) or {},
+                    score=scored_point.score,
+                )
+                chunks.append(chunk)
+
+            logger.info(f"Qdrant search returned {len(chunks)} results")
+            return chunks
+        except Exception as e:
+            logger.error(f"Qdrant search failed: {e}")
             return []
-
-        query_norm = np.linalg.norm(query)
-        if query_norm == 0:
-            return []
-
-        scores = []
-        for item in self.embeddings:
-            emb = item["embedding"]
-            dot = np.dot(query, emb)
-            norm = query_norm * np.linalg.norm(emb)
-            score = float(dot / norm) if norm != 0 else 0.0
-            scores.append(score)
-
-        indices = list(range(len(self.embeddings)))
-        if document_ids:
-            indices = [i for i in indices if self.embeddings[i]["chunk"].document_id in document_ids]
-
-        indices.sort(key=lambda i: scores[i], reverse=True)
-        top_indices = indices[:top_k]
-
-        results = []
-        for idx in top_indices:
-            chunk = self.embeddings[idx]["chunk"]
-            chunk.score = scores[idx]
-            results.append(chunk)
-
-        logger.info(f"Vector search returned {len(results)} results")
-        return results
 
     def delete_by_document(self, document_id: str) -> int:
-        original = len(self.embeddings)
-        self.embeddings = [e for e in self.embeddings if e["chunk"].document_id != document_id]
-        deleted = original - len(self.embeddings)
-        if deleted > 0:
-            self._save()
-            logger.info(f"Deleted {deleted} vectors for document {document_id}")
-        return deleted
+        try:
+            collections = self.client.get_collections().collections
+            if not any(c.name == self.collection_name for c in collections):
+                return 0
+
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=document_id),
+                        )
+                    ]
+                ),
+                wait=True,
+            )
+            logger.info(f"Deleted vectors for document {document_id} from Qdrant")
+            return 1
+        except Exception as e:
+            logger.error(f"Failed to delete vectors from Qdrant: {e}")
+            return 0
 
     def clear(self) -> None:
-        """Manually clear all vectors. Useful when switching embedding models."""
-        self._clear_store()
-        logger.info("Vector store manually cleared.")
+        try:
+            collections = self.client.get_collections().collections
+            if any(c.name == self.collection_name for c in collections):
+                self.client.delete_collection(self.collection_name)
+                logger.info(f"Deleted Qdrant collection '{self.collection_name}'")
+            self._dimension = None
+        except Exception as e:
+            logger.error(f"Failed to clear Qdrant collection: {e}")
 
     @property
     def dimension(self) -> Optional[int]:
@@ -222,11 +232,18 @@ class VectorStore:
 
     @property
     def count(self) -> int:
-        return len(self.embeddings)
+        try:
+            collections = self.client.get_collections().collections
+            if not any(c.name == self.collection_name for c in collections):
+                return 0
+            result = self.client.count(self.collection_name)
+            return result.count
+        except Exception as e:
+            logger.warning(f"Could not get Qdrant count: {e}")
+            return 0
 
 
 _vector_store: Optional[VectorStore] = None
-
 
 def get_vector_store() -> VectorStore:
     global _vector_store

@@ -68,7 +68,7 @@ class RAGNodes:
         graded = []
         scores = []
 
-        # Grade top 20 documents to save tokens
+        
         for doc in docs[:20]:
             try:
                 prompt = GRADER_USER_TEMPLATE.format(
