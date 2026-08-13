@@ -8,6 +8,10 @@ from app.config import get_settings
 from app.core.logging import setup_logging
 from app.api.v1 import documents, chat, health
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,10 +40,14 @@ def create_app() -> FastAPI:
     )
 
     prefix = settings.api_prefix
+    
+    # Existing routes
     app.include_router(health.router, prefix=prefix, tags=["Health"])
     app.include_router(documents.router, prefix=f"{prefix}/documents", tags=["Documents"])
     app.include_router(chat.router, prefix=f"{prefix}/chat", tags=["Chat"])
-
+    
+    # from evaluation.api import router as evaluate_router
+    # app.include_router(evaluate_router, prefix=f"{sys.prefix}/evaluate", tags=["Evaluation"])
     return app
 
 

@@ -1,6 +1,7 @@
 """Chat and RAG orchestration service."""
 import asyncio
 import json
+import queue
 from typing import AsyncGenerator
 
 from app.config import get_settings
@@ -21,9 +22,9 @@ class ChatService:
         self.llm = get_llm_provider()
 
     async def chat(self, question: str) -> ChatResponse:
-        """Synchronous chat with full CRAG pipeline."""
+        """Async chat with full CRAG pipeline via thread pool."""
         try:
-            # Run blocking sync invoke in thread pool
+            # Run blocking sync invoke in thread pool — event loop block nahi hoga
             result = await asyncio.to_thread(self.crag.invoke, question)
 
             return ChatResponse(
@@ -46,9 +47,9 @@ class ChatService:
             )
 
     async def chat_stream(self, question: str) -> AsyncGenerator[str, None]:
-        """Streaming chat response via SSE."""
+        """Streaming chat response via SSE — fully async, event loop block nahi hota."""
         try:
-            # Run blocking sync invoke in thread pool — isse event loop block nahi hoga
+            # Run blocking CRAG invoke in thread pool
             result = await asyncio.to_thread(self.crag.invoke, question)
             docs = result.get("reranked_documents", [])
             answer = result.get("answer", "")
@@ -57,7 +58,7 @@ class ChatService:
 
             # Agar insufficient evidence hai ya koi doc nahi — seedha answer bhejo
             if not docs or result.get("generation_metadata", {}).get("insufficient_evidence"):
-                safe_answer = json.dumps(answer)  # PROPER JSON string, repr() Nahi!
+                safe_answer = json.dumps(answer)
                 yield f'data: {{"type": "token", "content": {safe_answer}}}\n\n'
                 yield f'data: {{"type": "done"}}\n\n'
                 return
@@ -71,14 +72,36 @@ class ChatService:
             context = "\n\n".join(context_parts)
             prompt = RESPONDER_USER_TEMPLATE.format(context=context, question=question)
 
-            # Stream answer with proper JSON encoding
-            for token in self.llm.generate_stream(
-                system_prompt=RESPONDER_SYSTEM_PROMPT,
-                user_prompt=prompt,
-                temperature=0.1,
-                max_tokens=2048,
-            ):
-                safe_token = json.dumps(token)  # PROPER JSON encoding
+            # --- Async LLM Streaming via Thread Pool + Queue ---
+            # Yeh pattern ensure karta hai ke har token generation event loop ko block NA kare
+            token_q: queue.Queue = queue.Queue()
+
+            def _generate_tokens():
+                """Blocking LLM stream — runs in separate thread."""
+                try:
+                    for token in self.llm.generate_stream(
+                        system_prompt=RESPONDER_SYSTEM_PROMPT,
+                        user_prompt=prompt,
+                        temperature=0.1,
+                        max_tokens=2048,
+                    ):
+                        token_q.put(token)
+                    token_q.put(None)  # Sentinel: done
+                except Exception as exc:
+                    token_q.put(exc)  # Sentinel: error
+
+            # Background thread mein generation start karo
+            asyncio.create_task(asyncio.to_thread(_generate_tokens))
+
+            # Async yield tokens as they arrive
+            while True:
+                token = await asyncio.to_thread(token_q.get)
+                if token is None:
+                    break
+                if isinstance(token, Exception):
+                    raise token
+
+                safe_token = json.dumps(token)
                 yield f'data: {{"type": "token", "content": {safe_token}}}\n\n'
 
             # Metadata bhejo

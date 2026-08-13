@@ -1,45 +1,104 @@
-import { Routes, Route, Link } from 'react-router-dom'
-import { FileText, MessageSquare, LayoutDashboard, Upload } from 'lucide-react'
-import Dashboard from './pages/Dashboard'
-import DocumentLibrary from './pages/DocumentLibrary'
-import UploadPage from './pages/UploadPage'
-import ChatPage from './pages/ChatPage'
+import { useState, useEffect } from 'react';
+import { Routes, Route, Link, useLocation } from 'react-router-dom';
+import {
+  FileText,
+  MessageSquare,
+  LayoutDashboard,
+  Upload,
+  Brain,
+  Activity,
+  ChevronRight
+} from 'lucide-react';
+import Dashboard from './pages/Dashboard';
+import DocumentLibrary from './pages/DocumentLibrary';
+import UploadPage from './pages/UploadPage';
+import ChatPage from './pages/ChatPage';
+import SplashScreen from './components/SplashScreen.tsx';
 
 export default function App() {
-  return (
-    <div className="min-h-screen flex">
-      <aside className="w-64 bg-white border-r border-gray-200 flex flex-col">
-        <div className="p-6 border-b border-gray-200">
-          <h1 className="text-xl font-bold text-blue-900 flex items-center gap-2">
-            <FileText size={24} />
-            CRAG Search
-          </h1>
-        </div>
-        <nav className="flex-1 p-4 space-y-2">
-          <NavLink to="/" icon={<LayoutDashboard size={18} />}>Dashboard</NavLink>
-          <NavLink to="/upload" icon={<Upload size={18} />}>Upload</NavLink>
-          <NavLink to="/documents" icon={<FileText size={18} />}>Documents</NavLink>
-          <NavLink to="/chat" icon={<MessageSquare size={18} />}>Chat</NavLink>
-        </nav>
-     
-      </aside>
-      <main className="flex-1 p-8 overflow-auto">
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/upload" element={<UploadPage />} />
-          <Route path="/documents" element={<DocumentLibrary />} />
-          <Route path="/chat" element={<ChatPage />} />
-        </Routes>
-      </main>
-    </div>
-  )
-}
+  const [showSplash, setShowSplash] = useState(false);
+  const location = useLocation();
 
-function NavLink({ to, icon, children }: { to: string; icon: React.ReactNode; children: React.ReactNode }) {
+  // Check if splash should show (once per session)
+  useEffect(() => {
+    const hasSeenSplash = sessionStorage.getItem('crag-splash-seen');
+    if (!hasSeenSplash) {
+      setShowSplash(true);
+    }
+  }, []);
+
+  const handleSplashComplete = () => {
+    sessionStorage.setItem('crag-splash-seen', 'true');
+    setShowSplash(false);
+  };
+
+  const navItems = [
+    { path: '/', label: 'Dashboard', icon: LayoutDashboard },
+    { path: '/upload', label: 'Upload', icon: Upload },
+    { path: '/documents', label: 'Documents', icon: FileText },
+    { path: '/chat', label: 'Chat', icon: MessageSquare },
+  ];
+
   return (
-    <Link to={to} className="flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
-      {icon}
-      <span className="font-medium">{children}</span>
-    </Link>
-  )
+    <>
+      {/* Splash Animation */}
+      {showSplash && <SplashScreen onComplete={handleSplashComplete} />}
+
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex">
+        {/* Sidebar */}
+        <aside className="w-64 border-r border-slate-800/60 bg-slate-900/80 backdrop-blur-xl flex flex-col">
+          {/* Logo */}
+          <div className="p-6 border-b border-slate-800/60">
+            <div className="flex items-center gap-3">
+              <div className="relative">
+                <div className="absolute inset-0 bg-cyan-500/20 blur-lg rounded-full" />
+                <Brain className="relative w-8 h-8 text-cyan-400" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold bg-gradient-to-r from-cyan-400 to-violet-400 bg-clip-text text-transparent">
+                  CRAG Search
+                </h1>
+                <p className="text-[10px] text-slate-500 uppercase tracking-widest">Knowledge Base</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Navigation */}
+          <nav className="flex-1 p-4 space-y-1">
+            {navItems.map((item) => {
+              const isActive = location.pathname === item.path;
+              return (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all duration-300 group ${
+                    isActive
+                      ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 shadow-[0_0_15px_rgba(6,182,212,0.1)]'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50 border border-transparent'
+                  }`}
+                >
+                  <item.icon size={18} className="transition-transform group-hover:scale-110" />
+                  <span>{item.label}</span>
+                  {isActive && <ChevronRight size={14} className="ml-auto text-cyan-400/60" />}
+                </Link>
+              );
+            })}
+          </nav>
+
+          {/* Footer */}
+        
+        </aside>
+
+        {/* Main Content */}
+        <main className="flex-1 overflow-auto">
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/upload" element={<UploadPage />} />
+            <Route path="/documents" element={<DocumentLibrary />} />
+            <Route path="/chat" element={<ChatPage />} />
+          </Routes>
+        </main>
+      </div>
+    </>
+  );
 }

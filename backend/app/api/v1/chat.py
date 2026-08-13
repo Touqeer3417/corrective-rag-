@@ -14,7 +14,7 @@ async def chat(
     body: ChatRequest,
     chat_service: ChatService = Depends(get_chat_svc),
 ):
-    """Synchronous chat endpoint."""
+    """Async chat endpoint — CRAG pipeline thread pool mein chalti hai."""
     try:
         return await chat_service.chat(body.question)
     except Exception as e:
@@ -23,10 +23,10 @@ async def chat(
 
 @router.post("/stream")
 async def chat_stream(
-    body: ChatRequest,  # Consistent: ChatRequest use karo, alag ChatBody nahi
+    body: ChatRequest,
     chat_service: ChatService = Depends(get_chat_svc),
 ):
-    """Streaming chat endpoint via SSE."""
+    """Streaming chat endpoint via SSE — fully non-blocking."""
     try:
         return StreamingResponse(
             chat_service.chat_stream(body.question),

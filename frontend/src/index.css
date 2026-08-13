@@ -3,12 +3,120 @@
 @tailwind utilities;
 
 @layer base {
-  body { @apply bg-gray-50 text-gray-900; }
+  :root {
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%;
+  }
+
+  body {
+    @apply bg-slate-950 text-slate-100 antialiased;
+    background-image:
+      radial-gradient(ellipse at top, rgba(6, 182, 212, 0.03) 0%, transparent 50%),
+      radial-gradient(ellipse at bottom right, rgba(139, 92, 246, 0.03) 0%, transparent 50%);
+    background-attachment: fixed;
+  }
+
+  /* Custom scrollbar for dark theme */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(71, 85, 105, 0.4);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(71, 85, 105, 0.6);
+  }
 }
 
-@layer components {
-  .btn-primary { @apply px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors; }
-  .btn-secondary { @apply px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition-colors; }
-  .card { @apply bg-white rounded-xl shadow-sm border border-gray-200 p-6; }
-  .input { @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500; }
+@layer utilities {
+  /* Glassmorphism card utility */
+  .glass-card {
+    @apply rounded-2xl border border-slate-700/50 bg-slate-900/40 backdrop-blur-xl;
+  }
+
+  /* Gradient text utility */
+  .gradient-text {
+    @apply bg-gradient-to-r from-cyan-400 via-violet-400 to-emerald-400 bg-clip-text text-transparent;
+  }
+
+  /* Neon glow utilities */
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(6, 182, 212, 0.15);
+  }
+
+  .glow-violet {
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.15);
+  }
+
+  .glow-emerald {
+    box-shadow: 0 0 20px rgba(16, 185, 129, 0.15);
+  }
+
+  /* Animation utilities */
+  .animate-in {
+    animation: animateIn 0.3s ease-out forwards;
+  }
+
+  @keyframes animateIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* Subtle grid pattern overlay */
+  .grid-pattern {
+    background-image: radial-gradient(circle at 1px 1px, rgba(148, 163, 184, 0.05) 1px, transparent 0);
+    background-size: 24px 24px;
+  }
+
+  /* Animated gradient text */
+  .animate-gradient {
+    background-size: 200% 200%;
+    animation: gradientShift 3s ease infinite;
+  }
+
+  @keyframes gradientShift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+}
+
+/* Splash screen keyframes */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Smooth transitions for all interactive elements */
+button, input, a {
+  @apply transition-all duration-200;
+}
+
+/* Focus states */
+input:focus, button:focus-visible {
+  @apply outline-none ring-2 ring-cyan-500/20 ring-offset-2 ring-offset-slate-950;
 }
