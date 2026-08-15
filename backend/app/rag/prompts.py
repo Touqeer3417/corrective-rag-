@@ -23,45 +23,37 @@ Document excerpt:
 
 Evaluate relevance."""
 
-
 # ============================================================================
-# NEW BATCHED GRADER PROMPT (PRODUCTION-GRADE: 1 LLM call for ALL docs)
+# NEW OPTIMIZED BATCH GRADER PROMPT (Production: 1 LLM call, max 8 docs)
 # ============================================================================
 BATCH_GRADER_SYSTEM_PROMPT = """You are a document relevance grader for a Retrieval-Augmented Generation (RAG) system.
 
-Your task: Evaluate ALL provided document chunks and determine which are relevant to answering the user's question.
+Task: Evaluate the provided document chunks and determine which are relevant to the user's question.
 
-Instructions:
-1. For EACH document chunk, decide if it contains information that helps answer the question.
-2. A document is "relevant" ONLY if it contains substantive information that directly helps answer the question.
-3. A document is "not relevant" if it is off-topic, contains only tangential information, or is completely unrelated.
-4. Score relevance from 0.0 to 1.0 for each document.
-5. Provide a brief 1-sentence reasoning for each grade.
+Rules:
+1. These are ALREADY the most promising candidates (pre-filtered by semantic similarity).
+2. For EACH doc, assign a relevance score 0.0-1.0 and a true/false verdict.
+3. Score > 0.6 = highly relevant, 0.3-0.6 = marginal, < 0.3 = not relevant.
+4. Keep reasons to 5-8 words max.
 
-Respond ONLY with a JSON object in this exact format:
+Respond ONLY with valid JSON:
 {
   "grades": [
-    {"doc_index": 0, "relevant": true, "score": 0.95, "reason": "brief reason"},
-    {"doc_index": 1, "relevant": false, "score": 0.1, "reason": "brief reason"},
-    ...
+    {"doc_index": 0, "relevant": true, "score": 0.92, "reason": "contains exact answer"},
+    {"doc_index": 1, "relevant": false, "score": 0.15, "reason": "off-topic"}
   ],
-  "overall_assessment": "brief summary of overall context quality",
+  "overall_assessment": "1 sentence summary",
   "needs_web_search": false
 }
 
-RULES:
-- needs_web_search = true ONLY if ZERO documents are relevant or overall confidence is very low.
-- Do NOT include any text outside the JSON.
-- Ensure every doc_index from 0 to N-1 has a grade.
-- Score 0.0-0.3 = Not relevant, 0.3-0.6 = Somewhat relevant, 0.6-1.0 = Highly relevant"""
+needs_web_search = true ONLY if ZERO docs are relevant. No text outside JSON."""
 
 BATCH_GRADER_USER_TEMPLATE = """Question: {question}
 
-Document Chunks to Evaluate:
+Document Chunks (pre-filtered top candidates):
 {documents}
 
-Evaluate ALL documents and return the JSON response."""
-
+Evaluate ALL docs. Return JSON only."""
 
 # ============================================================================
 # Query Transformation Prompt
@@ -82,7 +74,6 @@ TRANSFORM_USER_TEMPLATE = """Original question: {question}
 
 Rewrite this into an optimized search query for finding relevant company documents."""
 
-
 # ============================================================================
 # Answer Generation Prompt
 # ============================================================================
@@ -102,7 +93,6 @@ RESPONDER_USER_TEMPLATE = """Context documents:
 Question: {question}
 
 Provide a grounded answer. Explain the answer in your own words — do NOT copy text verbatim from the documents. If insufficient evidence exists, state so clearly."""
-
 
 # ============================================================================
 # Fallback insufficient evidence message

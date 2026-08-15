@@ -122,6 +122,16 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=350, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
 
+    # -----------------------------------------------------------------------
+    # GRADING OPTIMIZATION (NEW — Production 3-Tier Grading)
+    # -----------------------------------------------------------------------
+    grade_max_docs_per_batch: int = Field(default=8, alias="GRADE_MAX_DOCS_PER_BATCH")
+    grade_max_chars_per_doc: int = Field(default=400, alias="GRADE_MAX_CHARS_PER_DOC")
+    grade_embedding_pre_filter: bool = Field(default=True, alias="GRADE_EMBEDDING_PRE_FILTER")
+    grade_embedding_threshold: float = Field(default=0.20, alias="GRADE_EMBEDDING_THRESHOLD")
+    grade_fast_path_enabled: bool = Field(default=True, alias="GRADE_FAST_PATH_ENABLED")
+    grade_fast_path_threshold: float = Field(default=0.90, alias="GRADE_FAST_PATH_THRESHOLD")
+
     # Security
     allowed_extensions: list = Field(default=["pdf", "docx", "txt", "md"], alias="ALLOWED_EXTENSIONS")
 
@@ -133,14 +143,14 @@ class Settings(BaseSettings):
         return v
 
     # -----------------------------------------------------------------------
-    # Caching (Redis + In-Memory)  -- NEW
+    # Caching (Redis + In-Memory) -- NEW
     # -----------------------------------------------------------------------
     redis_url: Optional[str] = Field(default=None, alias="REDIS_URL")
     cache_enabled: bool = Field(default=True, alias="CACHE_ENABLED")
-    cache_embedding_ttl: int = Field(default=86400, alias="CACHE_EMBEDDING_TTL")      # 24h
-    cache_retrieval_ttl: int = Field(default=3600, alias="CACHE_RETRIEVAL_TTL")       # 1h
-    cache_grade_ttl: int = Field(default=3600, alias="CACHE_GRADE_TTL")               # 1h
-    cache_answer_ttl: int = Field(default=1800, alias="CACHE_ANSWER_TTL")             # 30m
+    cache_embedding_ttl: int = Field(default=86400, alias="CACHE_EMBEDDING_TTL")  # 24h
+    cache_retrieval_ttl: int = Field(default=3600, alias="CACHE_RETRIEVAL_TTL")  # 1h
+    cache_grade_ttl: int = Field(default=3600, alias="CACHE_GRADE_TTL")  # 1h
+    cache_answer_ttl: int = Field(default=1800, alias="CACHE_ANSWER_TTL")  # 30m
 
     # -----------------------------------------------------------------------
     # Helper properties

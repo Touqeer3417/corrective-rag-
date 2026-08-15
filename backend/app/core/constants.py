@@ -20,3 +20,11 @@ DEFAULT_SYSTEM_PROMPT = """You are a company document assistant. Your sole purpo
 MAX_RETRIES_DEFAULT = 2
 TOP_K_HYBRID_DEFAULT = 50
 TOP_K_RERANK_DEFAULT = 10
+
+# ---------------------------------------------------------------------------
+# GRADING CONSTANTS (NEW — Production 3-Tier Grading)
+# ---------------------------------------------------------------------------
+GRADE_MAX_DOCS_DEFAULT = 8
+GRADE_MAX_CHARS_DEFAULT = 400
+GRADE_EMBEDDING_THRESHOLD_DEFAULT = 0.20
+GRADE_FAST_PATH_THRESHOLD_DEFAULT = 0.90

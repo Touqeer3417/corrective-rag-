@@ -1,6 +1,9 @@
 """LangGraph node implementations for CRAG workflow WITH CACHING."""
+import hashlib
 import json
 from typing import List, Optional
+
+import numpy as np
 
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -21,6 +24,7 @@ from app.retrieval.reranker import get_reranker
 from app.retrieval.embeddings import get_embedding_model
 
 logger = get_logger("rag.nodes")
+
 
 class RAGNodes:
     """Collection of LangGraph node functions."""
@@ -54,10 +58,15 @@ class RAGNodes:
         return state
 
     # ========================================================================
-    # NODE: Grade Documents (PRODUCTION-GRADE BATCHED + CACHED)
+    # NODE: Grade Documents (PRODUCTION-GRADE 3-TIER: Embedding + Batch LLM)
     # ========================================================================
     def grade_documents(self, state: RAGState) -> RAGState:
-        """Node: LLM-based document relevance grading — BATCHED + CACHED."""
+        """Node: Optimized relevance grading — Embedding pre-filter + 1 batched LLM call.
+
+        Tier 1: Embedding cosine similarity (FREE) — filters & sorts docs.
+        Tier 2: Fast path — if top doc similarity > threshold, skip LLM entirely.
+        Tier 3: Batch LLM grade — only top-N docs, truncated to max chars.
+        """
         docs = state.get("documents", [])
         question = state["question"]
 
@@ -66,51 +75,192 @@ class RAGNodes:
             state["graded_documents"] = []
             state["retrieval_score"] = 0.0
             state["relevance_scores"] = []
-            state["grading_metadata"] = {"error": "no_documents"}
+            state["grading_metadata"] = {"error": "no_documents", "llm_calls_made": 0}
             return state
 
         settings = get_settings()
         use_cache = getattr(settings, "cache_enabled", True)
+        max_docs = settings.grade_max_docs_per_batch
+        max_chars = settings.grade_max_chars_per_doc
+        pre_filter = settings.grade_embedding_pre_filter
+        emb_threshold = settings.grade_embedding_threshold
+        fast_path = settings.grade_fast_path_enabled
+        fast_threshold = settings.grade_fast_path_threshold
 
-        # Build documents block for cache key
+        # ======================================================================
+        # TIER 1: Embedding Similarity Pre-Filter
+        # ======================================================================
+        pre_filtered_docs = docs
+        embedding_scores: List[float] = []
+        pre_filter_applied = False
+
+        if pre_filter and len(docs) > 1 and self.embedder is not None:
+            try:
+                # Encode query (cached internally by embedder)
+                query_emb = self.embedder.encode_query(question)
+                q_vec = np.array(query_emb, dtype=np.float32)
+                q_norm = np.linalg.norm(q_vec)
+                if q_norm == 0:
+                    q_norm = 1.0
+
+                # Batch encode all docs (1 API call for OpenAI, 1 batch for local)
+                doc_texts = [d.text[:max_chars] for d in docs]
+                doc_embs = self.embedder.encode(doc_texts)
+
+                # Compute cosine similarities
+                similarities = []
+                for emb in doc_embs:
+                    d_vec = np.array(emb, dtype=np.float32)
+                    d_norm = np.linalg.norm(d_vec)
+                    if d_norm == 0:
+                        similarities.append(0.0)
+                    else:
+                        sim = float(np.dot(q_vec, d_vec) / (q_norm * d_norm))
+                        similarities.append(sim)
+
+                # Attach similarities to doc metadata for observability
+                for doc, sim in zip(docs, similarities):
+                    doc.metadata["embedding_similarity"] = round(sim, 4)
+
+                # Sort by similarity descending
+                scored_docs = list(zip(docs, similarities))
+                scored_docs.sort(key=lambda x: x[1], reverse=True)
+
+                # ------------------------------------------------------------------
+                # TIER 2: Fast Path — skip LLM if top doc is extremely similar
+                # ------------------------------------------------------------------
+                if fast_path and scored_docs and scored_docs[0][1] >= fast_threshold:
+                    top_sim = scored_docs[0][1]
+                    logger.info(f"[GRADER] FAST PATH triggered (top_sim={top_sim:.3f}). Skipping LLM.")
+
+                    graded = []
+                    scores = []
+                    kept_indices = []
+                    for i, (doc, sim) in enumerate(scored_docs):
+                        relevant = sim >= emb_threshold
+                        doc.score = min(sim, 1.0)
+                        if relevant:
+                            graded.append(doc)
+                            scores.append(doc.score)
+                            kept_indices.append(i)
+
+                    retrieval_score = sum(scores) / len(scores) if scores else 0.0
+
+                    grading_metadata = {
+                        "total_docs": len(docs),
+                        "llm_calls_made": 0,
+                        "fallback_used": False,
+                        "fast_path": True,
+                        "pre_filter_applied": True,
+                        "relevant_docs": len(graded),
+                        "details": [
+                            {
+                                "doc_index": i,
+                                "relevant": sim >= emb_threshold,
+                                "score": round(sim, 3),
+                                "reason": f"Embedding similarity: {sim:.3f}",
+                            }
+                            for i, (_, sim) in enumerate(scored_docs)
+                        ],
+                    }
+
+                    state["graded_documents"] = graded
+                    state["relevance_scores"] = scores
+                    state["retrieval_score"] = retrieval_score
+                    state["grading_metadata"] = grading_metadata
+                    return state
+
+                # Filter out docs below threshold, keep top max_docs
+                filtered = [(d, s) for d, s in scored_docs if s >= emb_threshold]
+                if not filtered:
+                    # Safety: if nothing passes threshold, keep top 3
+                    filtered = scored_docs[:3]
+
+                pre_filtered_docs = [d for d, s in filtered[:max_docs]]
+                embedding_scores = [s for d, s in filtered[:max_docs]]
+                pre_filter_applied = True
+
+                logger.info(
+                    f"[GRADER] Pre-filter: {len(docs)} docs → {len(pre_filtered_docs)} docs "
+                    f"(top_sim={scored_docs[0][1]:.3f}, threshold={emb_threshold})"
+                )
+
+            except Exception as e:
+                logger.warning(f"[GRADER] Embedding pre-filter failed: {e}. Falling back to all docs.")
+                pre_filtered_docs = docs
+                embedding_scores = []
+
+        # ======================================================================
+        # Build optimized prompt with reduced docs & chars
+        # ======================================================================
+        docs_to_grade = pre_filtered_docs if pre_filter_applied else docs[:max_docs]
+
+        if not docs_to_grade:
+            logger.warning("[GRADER] No documents after pre-filter")
+            state["graded_documents"] = []
+            state["retrieval_score"] = 0.0
+            state["relevance_scores"] = []
+            state["grading_metadata"] = {
+                "error": "no_documents_after_prefilter",
+                "llm_calls_made": 0,
+            }
+            return state
+
         doc_parts = []
-        for i, doc in enumerate(docs[:20]):
-            text = doc.text[:800]
-            if len(doc.text) > 800:
+        for i, doc in enumerate(docs_to_grade):
+            text = doc.text[:max_chars]
+            if len(doc.text) > max_chars:
                 text += "... [truncated]"
-            doc_parts.append(f"--- DOCUMENT [{i}] ---\n{text}\n")
+            meta = f"Source: {doc.document_name}"
+            if doc.page_number:
+                meta += f", Page {doc.page_number}"
+            doc_parts.append(f"--- DOC [{i}] | {meta} ---\n{text}\n")
         documents_block = "\n".join(doc_parts)
 
-        # Try cache first
+        # ======================================================================
+        # Cache check (optimized key using SHA256 hash — no giant strings)
+        # ======================================================================
+        cache_key: Optional[str] = None
         if use_cache:
+            docs_hash = hashlib.sha256(documents_block.encode("utf-8")).hexdigest()[:24]
             cache_key = _make_key(
-                "grade_documents",
+                "grade_documents_v2",
                 question.strip().lower(),
-                documents_block,
-                BATCH_GRADER_SYSTEM_PROMPT
+                docs_hash,
+                len(docs_to_grade),
+                max_chars,
             )
             cached = self._grade_cache.get(cache_key)
             if cached is not None:
-                logger.info(f"[GRADE CACHE] HIT for {len(docs)} documents")
-                state["graded_documents"] = [docs[i] for i in cached["kept_indices"]]
+                logger.info(f"[GRADE CACHE] HIT for {len(docs_to_grade)} documents")
+                state["graded_documents"] = [
+                    docs_to_grade[i] for i in cached["kept_indices"] if 0 <= i < len(docs_to_grade)
+                ]
                 state["relevance_scores"] = cached["relevance_scores"]
                 state["retrieval_score"] = cached["retrieval_score"]
                 state["grading_metadata"] = cached["grading_metadata"]
                 return state
 
-        logger.info(f"[GRADER] Grading {len(docs)} documents in 1 batched LLM call")
+        # ======================================================================
+        # TIER 3: LLM Batch Grade (1 call, ~70% smaller prompt than before)
+        # ======================================================================
+        logger.info(f"[GRADER] Grading {len(docs_to_grade)} documents in 1 batched LLM call")
 
         user_prompt = BATCH_GRADER_USER_TEMPLATE.format(
             question=question,
             documents=documents_block,
         )
 
-        graded = []
-        scores = []
+        graded: List = []
+        scores: List[float] = []
+        kept_indices: List[int] = []
         grading_metadata = {
             "total_docs": len(docs),
+            "graded_count": len(docs_to_grade),
             "llm_calls_made": 1,
             "fallback_used": False,
+            "pre_filter_applied": pre_filter_applied,
+            "fast_path": False,
             "details": [],
         }
 
@@ -138,15 +288,14 @@ class RAGNodes:
             for g in grades:
                 try:
                     idx = int(g.get("doc_index", -1))
-                    if 0 <= idx < len(docs):
+                    if 0 <= idx < len(docs_to_grade):
                         grade_map[idx] = g
                 except (ValueError, TypeError):
                     continue
 
             relevant_count = 0
-            kept_indices = []
-            
-            for i, doc in enumerate(docs):
+
+            for i, doc in enumerate(docs_to_grade):
                 grade = grade_map.get(i)
 
                 if grade:
@@ -154,9 +303,15 @@ class RAGNodes:
                     relevant = grade.get("relevant", False)
                     reason = grade.get("reason", "")
                 else:
-                    score = 0.5
-                    relevant = True
-                    reason = "Missing grade - fallback to yes"
+                    # Fallback: use embedding score if available, else neutral 0.5
+                    if pre_filter_applied and i < len(embedding_scores):
+                        score = embedding_scores[i]
+                        relevant = score >= emb_threshold
+                        reason = f"Missing LLM grade — fallback to embedding score: {score:.3f}"
+                    else:
+                        score = 0.5
+                        relevant = True
+                        reason = "Missing grade — fallback to yes"
                     grading_metadata["fallback_used"] = True
 
                 doc.score = score
@@ -182,12 +337,12 @@ class RAGNodes:
 
             logger.info(
                 f"[GRADER] Avg relevance: {sum(scores)/len(scores) if scores else 0:.3f}, "
-                f"kept {len(graded)}/{len(docs)}, "
-                f"LLM calls: 1 (was {len(docs)})"
+                f"kept {len(graded)}/{len(docs_to_grade)} (of {len(docs)} total), "
+                f"LLM calls: 1"
             )
 
             # Store in cache
-            if use_cache:
+            if use_cache and cache_key is not None:
                 cache_value = {
                     "kept_indices": kept_indices,
                     "relevance_scores": scores,
@@ -195,18 +350,33 @@ class RAGNodes:
                     "grading_metadata": grading_metadata,
                 }
                 self._grade_cache.set(cache_key, cache_value)
-                logger.info(f"[GRADE CACHE] Stored result for {len(docs)} docs")
+                logger.info(f"[GRADE CACHE] Stored result for {len(docs_to_grade)} docs")
 
         except Exception as e:
-            logger.error(f"[GRADER] Batched grading failed: {e}. Falling back to keeping all docs.")
-            for doc in docs:
-                doc.score = 0.5
-                graded.append(doc)
-                scores.append(0.5)
+            logger.error(f"[GRADER] Batched grading failed: {e}. Falling back.")
 
-            grading_metadata["fallback_used"] = True
-            grading_metadata["error"] = str(e)
-            grading_metadata["relevant_docs"] = len(docs)
+            # Smart fallback: if pre-filter was applied, use embedding scores
+            if pre_filter_applied and embedding_scores:
+                graded = []
+                scores = []
+                for i, doc in enumerate(docs_to_grade):
+                    score = embedding_scores[i] if i < len(embedding_scores) else 0.5
+                    doc.score = score
+                    if score >= 0.3:
+                        graded.append(doc)
+                        scores.append(score)
+                grading_metadata["fallback_used"] = True
+                grading_metadata["error"] = str(e)
+                grading_metadata["relevant_docs"] = len(graded)
+            else:
+                # Ultimate fallback: keep all with neutral score
+                for doc in docs_to_grade:
+                    doc.score = 0.5
+                    graded.append(doc)
+                    scores.append(0.5)
+                grading_metadata["fallback_used"] = True
+                grading_metadata["error"] = str(e)
+                grading_metadata["relevant_docs"] = len(docs_to_grade)
 
         state["graded_documents"] = graded
         state["relevance_scores"] = scores
@@ -343,6 +513,7 @@ class RAGNodes:
 
 # Singleton instance
 _nodes_instance: Optional[RAGNodes] = None
+
 
 def get_rag_nodes() -> RAGNodes:
     global _nodes_instance
