@@ -1,11 +1,11 @@
-"""Embedding model with OpenAI and local fallback support."""
+"""Embedding model with OpenAI and local fallback support + CACHING."""
 from typing import List, Optional
 
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.core.cache import get_embedding_cache, _make_key
 
 logger = get_logger("retrieval.embeddings")
-
 
 class EmbeddingModel:
     """Wrapper for embeddings — OpenAI (default) or local sentence-transformers."""
@@ -15,6 +15,7 @@ class EmbeddingModel:
         self.provider = self.settings.embedding_provider
         self._client = None
         self._local_model = None
+        self._cache = get_embedding_cache()
 
         if self.provider == "openai":
             self._init_openai()
@@ -91,7 +92,6 @@ class EmbeddingModel:
 
     def _encode_openai(self, texts: List[str]) -> List[List[float]]:
         """Call OpenAI Embeddings API with automatic batching."""
-        # OpenAI allows up to 2048 texts per request, but smaller batches are safer
         OPENAI_BATCH_LIMIT = 2048
         all_embeddings: List[List[float]] = []
 
@@ -124,15 +124,37 @@ class EmbeddingModel:
         return embeddings.tolist()
 
     # ------------------------------------------------------------------
-    # Query encode
+    # Query encode — WITH CACHE
     # ------------------------------------------------------------------
     def encode_query(self, text: str) -> List[float]:
-        """Encode a single query."""
+        """Encode a single query with caching."""
+        if not getattr(self.settings, "cache_enabled", True):
+            return self._encode_query_raw(text)
+        
+        # Build cache key from query text + provider + model
+        cache_key = _make_key(
+            "encode_query",
+            text.strip().lower(),
+            self.provider,
+            self.model_name if self.provider == "openai" else self.settings.embedding_model
+        )
+        
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.info(f"[EMBEDDING CACHE] HIT for query: {text[:50]}...")
+            return cached
+        
+        result = self._encode_query_raw(text)
+        self._cache.set(cache_key, result)
+        logger.info(f"[EMBEDDING CACHE] MISS for query: {text[:50]}... - cached")
+        return result
+
+    def _encode_query_raw(self, text: str) -> List[float]:
+        """Raw query encoding without cache."""
         if self.provider == "openai":
-            # OpenAI embeddings are symmetric — no instruction prefix needed
             return self.encode([text])[0]
 
-        # Local BGE-style models benefit from instruction prefix for asymmetric search
+        # Local BGE-style models benefit from instruction prefix
         query_text = f"Represent this sentence for searching relevant passages: {text}"
         return self.encode([query_text])[0]
 
@@ -141,7 +163,6 @@ class EmbeddingModel:
 # Singleton
 # ------------------------------------------------------------------
 _embedding_model: Optional[EmbeddingModel] = None
-
 
 def get_embedding_model() -> EmbeddingModel:
     global _embedding_model

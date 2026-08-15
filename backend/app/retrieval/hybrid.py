@@ -1,14 +1,13 @@
-"""Hybrid retrieval: dense + sparse fusion using Reciprocal Rank Fusion (RRF)."""
-from typing import Dict, List
-from typing import List, Optional
+"""Hybrid retrieval: dense + sparse fusion using Reciprocal Rank Fusion (RRF) + CACHING."""
+from typing import Dict, List, Optional
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.core.cache import get_retrieval_cache, _make_key
 from app.retrieval.dense import get_dense_retriever
 from app.retrieval.sparse import get_bm25_index
 from app.schemas.document import DocumentChunk
 
 logger = get_logger("retrieval.hybrid")
-
 
 def reciprocal_rank_fusion(
     dense_results: List[DocumentChunk],
@@ -16,34 +15,26 @@ def reciprocal_rank_fusion(
     k: int = 60,
     top_k: int = 50,
 ) -> List[DocumentChunk]:
-    """Fuse dense and sparse results using Reciprocal Rank Fusion.
-
-    RRF formula: score = sum(1 / (k + rank)) for each list containing the doc
-    """
-    # Build score maps by chunk_id
+    """Fuse dense and sparse results using Reciprocal Rank Fusion."""
     dense_scores: Dict[str, float] = {}
     sparse_scores: Dict[str, float] = {}
     all_chunks: Dict[str, DocumentChunk] = {}
 
-    # Dense ranks (already sorted by score descending)
     for rank, chunk in enumerate(dense_results, start=1):
         cid = chunk.chunk_id
         dense_scores[cid] = 1.0 / (k + rank)
         all_chunks[cid] = chunk
 
-    # Sparse ranks (sorted by BM25 score descending)
     for rank, chunk in enumerate(sparse_results, start=1):
         cid = chunk.chunk_id
         sparse_scores[cid] = 1.0 / (k + rank)
         if cid not in all_chunks:
             all_chunks[cid] = chunk
 
-    # Combine scores
     fused_scores: Dict[str, float] = {}
     for cid in all_chunks:
         fused_scores[cid] = dense_scores.get(cid, 0.0) + sparse_scores.get(cid, 0.0)
 
-    # Sort by fused score descending
     sorted_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
 
     results = []
@@ -56,11 +47,12 @@ def reciprocal_rank_fusion(
 
 
 class HybridRetriever:
-    """Hybrid retriever combining dense and sparse search."""
+    """Hybrid retriever combining dense and sparse search WITH CACHING."""
 
     def __init__(self):
         self.dense = get_dense_retriever()
         self.sparse = get_bm25_index()
+        self._cache = get_retrieval_cache()
 
     def search(
         self,
@@ -68,24 +60,49 @@ class HybridRetriever:
         top_k: int = 50,
         document_ids: Optional[List[str]] = None,
     ) -> List[DocumentChunk]:
-        """Perform hybrid search with RRF fusion.
-
-        Returns:
-            Fused and ranked list of DocumentChunks
-        """
+        """Perform hybrid search with RRF fusion and caching."""
         settings = get_settings()
+        
+        if not getattr(settings, "cache_enabled", True):
+            return self._search_raw(query, top_k, document_ids)
+        
+        # Build cache key
+        cache_key = _make_key(
+            "hybrid_search",
+            query.strip().lower(),
+            top_k,
+            tuple(sorted(document_ids)) if document_ids else None
+        )
+        
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.info(f"[RETRIEVAL CACHE] HIT for query: {query[:50]}... ({len(cached)} docs)")
+            # Reconstruct DocumentChunk objects
+            return [DocumentChunk(**doc) for doc in cached]
+        
+        results = self._search_raw(query, top_k, document_ids)
+        
+        # Cache as dicts for JSON serialization
+        self._cache.set(cache_key, [doc.model_dump() for doc in results])
+        logger.info(f"[RETRIEVAL CACHE] MISS for query: {query[:50]}... - cached {len(results)} docs")
+        return results
 
+    def _search_raw(
+        self,
+        query: str,
+        top_k: int = 50,
+        document_ids: Optional[List[str]] = None,
+    ) -> List[DocumentChunk]:
+        """Raw search without cache."""
+        settings = get_settings()
         logger.info(f"Hybrid search: '{query[:50]}...'")
 
-        # Parallel retrieval (in practice, could be async)
         dense_results = self.dense.search(query, top_k=top_k, document_ids=document_ids)
         sparse_results = self.sparse.search(query, top_k=top_k)
 
-        # Filter sparse results by document_ids if specified
         if document_ids:
             sparse_results = [r for r in sparse_results if r.document_id in document_ids]
 
-        # Fuse results
         fused = reciprocal_rank_fusion(
             dense_results=dense_results,
             sparse_results=sparse_results,
@@ -99,7 +116,6 @@ class HybridRetriever:
 
 # Singleton
 _hybrid_retriever: Optional[HybridRetriever] = None
-
 
 def get_hybrid_retriever() -> HybridRetriever:
     global _hybrid_retriever

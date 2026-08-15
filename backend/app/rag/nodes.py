@@ -1,9 +1,10 @@
-"""LangGraph node implementations for CRAG workflow."""
+"""LangGraph node implementations for CRAG workflow WITH CACHING."""
 import json
 from typing import List, Optional
 
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.core.cache import get_grade_cache, _make_key
 from app.rag.state import RAGState
 from app.rag.models import get_llm_provider
 from app.rag.prompts import (
@@ -21,7 +22,6 @@ from app.retrieval.embeddings import get_embedding_model
 
 logger = get_logger("rag.nodes")
 
-
 class RAGNodes:
     """Collection of LangGraph node functions."""
 
@@ -30,6 +30,7 @@ class RAGNodes:
         self.reranker = get_reranker()
         self.llm = get_llm_provider()
         self.embedder = get_embedding_model()
+        self._grade_cache = get_grade_cache()
 
     # ========================================================================
     # NODE: Retrieve Documents
@@ -53,29 +54,10 @@ class RAGNodes:
         return state
 
     # ========================================================================
-    # NODE: Grade Documents (PRODUCTION-GRADE BATCHED)
-    # ========================================================================
-    #
-    # FIX: Replaced N sequential LLM calls (1 per chunk) with 1 batched LLM call.
-    #
-    # BEFORE (anti-pattern):
-    #   for doc in docs[:20]:
-    #       result = self.llm.generate(...)  # <-- 20 calls!
-    #
-    # AFTER (production):
-    #   result = self.llm.generate(...)      # <-- 1 call for ALL docs
-    #
-    # BENEFITS:
-    #   - Latency: ~15-20x faster (1 round-trip vs 20 round-trips)
-    #   - Cost: ~60-80% cheaper (batching reduces overhead tokens)
-    #   - Reliability: fewer network failures, single retry point
+    # NODE: Grade Documents (PRODUCTION-GRADE BATCHED + CACHED)
     # ========================================================================
     def grade_documents(self, state: RAGState) -> RAGState:
-        """Node: LLM-based document relevance grading — BATCHED (1 LLM call).
-
-        Grades ALL documents in a SINGLE LLM call instead of calling the LLM
-        once per document. This is the core production fix.
-        """
+        """Node: LLM-based document relevance grading — BATCHED + CACHED."""
         docs = state.get("documents", [])
         question = state["question"]
 
@@ -87,29 +69,42 @@ class RAGNodes:
             state["grading_metadata"] = {"error": "no_documents"}
             return state
 
-        logger.info(f"[GRADER] Grading {len(docs)} documents in 1 batched LLM call")
+        settings = get_settings()
+        use_cache = getattr(settings, "cache_enabled", True)
 
-        # ------------------------------------------------------------------
-        # Build the batched prompt with ALL documents
-        # ------------------------------------------------------------------
+        # Build documents block for cache key
         doc_parts = []
-        for i, doc in enumerate(docs[:20]):  # Cap at 20 for safety
-            # Truncate each doc to 800 chars for the grader
+        for i, doc in enumerate(docs[:20]):
             text = doc.text[:800]
             if len(doc.text) > 800:
                 text += "... [truncated]"
             doc_parts.append(f"--- DOCUMENT [{i}] ---\n{text}\n")
-
         documents_block = "\n".join(doc_parts)
+
+        # Try cache first
+        if use_cache:
+            cache_key = _make_key(
+                "grade_documents",
+                question.strip().lower(),
+                documents_block,
+                BATCH_GRADER_SYSTEM_PROMPT
+            )
+            cached = self._grade_cache.get(cache_key)
+            if cached is not None:
+                logger.info(f"[GRADE CACHE] HIT for {len(docs)} documents")
+                state["graded_documents"] = [docs[i] for i in cached["kept_indices"]]
+                state["relevance_scores"] = cached["relevance_scores"]
+                state["retrieval_score"] = cached["retrieval_score"]
+                state["grading_metadata"] = cached["grading_metadata"]
+                return state
+
+        logger.info(f"[GRADER] Grading {len(docs)} documents in 1 batched LLM call")
 
         user_prompt = BATCH_GRADER_USER_TEMPLATE.format(
             question=question,
             documents=documents_block,
         )
 
-        # ------------------------------------------------------------------
-        # SINGLE LLM CALL for all documents
-        # ------------------------------------------------------------------
         graded = []
         scores = []
         grading_metadata = {
@@ -124,13 +119,11 @@ class RAGNodes:
                 system_prompt=BATCH_GRADER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 temperature=0.0,
-                max_tokens=2048,  # Increased for batch response
+                max_tokens=2048,
                 json_mode=True,
             )
 
-            # Parse JSON response
             text = result["text"].strip()
-            # Extract JSON if wrapped in markdown
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
@@ -141,9 +134,6 @@ class RAGNodes:
             needs_web_search = batch_result.get("needs_web_search", False)
             overall_assessment = batch_result.get("overall_assessment", "")
 
-            # ------------------------------------------------------------------
-            # Map grades back to documents
-            # ------------------------------------------------------------------
             grade_map = {}
             for g in grades:
                 try:
@@ -154,6 +144,8 @@ class RAGNodes:
                     continue
 
             relevant_count = 0
+            kept_indices = []
+            
             for i, doc in enumerate(docs):
                 grade = grade_map.get(i)
 
@@ -162,9 +154,8 @@ class RAGNodes:
                     relevant = grade.get("relevant", False)
                     reason = grade.get("reason", "")
                 else:
-                    # Fallback if LLM missed this doc
                     score = 0.5
-                    relevant = True  # Conservative: keep doc on failure
+                    relevant = True
                     reason = "Missing grade - fallback to yes"
                     grading_metadata["fallback_used"] = True
 
@@ -176,10 +167,10 @@ class RAGNodes:
                     "reason": reason,
                 })
 
-                # Keep document if relevant OR score >= 0.3 (marginally relevant)
                 if relevant or score >= 0.3:
                     graded.append(doc)
                     scores.append(score)
+                    kept_indices.append(i)
                     if relevant:
                         relevant_count += 1
                 else:
@@ -195,9 +186,19 @@ class RAGNodes:
                 f"LLM calls: 1 (was {len(docs)})"
             )
 
+            # Store in cache
+            if use_cache:
+                cache_value = {
+                    "kept_indices": kept_indices,
+                    "relevance_scores": scores,
+                    "retrieval_score": sum(scores) / len(scores) if scores else 0.0,
+                    "grading_metadata": grading_metadata,
+                }
+                self._grade_cache.set(cache_key, cache_value)
+                logger.info(f"[GRADE CACHE] Stored result for {len(docs)} docs")
+
         except Exception as e:
             logger.error(f"[GRADER] Batched grading failed: {e}. Falling back to keeping all docs.")
-            # CRITICAL FALLBACK: If batched grading fails, keep ALL documents
             for doc in docs:
                 doc.score = 0.5
                 graded.append(doc)
@@ -222,7 +223,6 @@ class RAGNodes:
         question = state["original_question"]
         current_transformed = state.get("transformed_query")
 
-        # If already transformed once, try expanding further
         if current_transformed:
             prompt = f"The previous query rewrite did not yield good results. Original: {question}. Previous rewrite: {current_transformed}. Generate a different, more specific search query."
         else:
@@ -243,7 +243,6 @@ class RAGNodes:
             logger.info(f"[TRANSFORM] New query: {transformed[:60]}...")
         except Exception as e:
             logger.error(f"Query transformation failed: {e}")
-            # Fallback: append keywords
             state["transformed_query"] = f"{question} company policy procedure"
             state["retry_count"] = state.get("retry_count", 0) + 1
 
@@ -274,7 +273,6 @@ class RAGNodes:
             state["reranked_documents"] = reranked
         except Exception as e:
             logger.error(f"Reranking failed: {e}")
-            # Fallback: use graded documents sorted by score
             state["reranked_documents"] = sorted(
                 docs, key=lambda x: x.score or 0.0, reverse=True
             )[:settings.top_k_rerank]
@@ -293,7 +291,6 @@ class RAGNodes:
         retry_count = state.get("retry_count", 0)
         max_retries = state.get("max_retries", 2)
 
-        # Check if we have sufficient evidence
         if not docs or (state.get("retrieval_score", 0) < 0.2 and retry_count >= max_retries):
             logger.warning("[RESPONDER] Insufficient evidence after max retries")
             state["answer"] = INSUFFICIENT_EVIDENCE_MESSAGE
@@ -306,9 +303,8 @@ class RAGNodes:
             }
             return state
 
-        # Build context from top documents
         context_parts = []
-        for i, doc in enumerate(docs[:8], 1):  # Use top 8 for context
+        for i, doc in enumerate(docs[:8], 1):
             context_parts.append(
                 f"[Document {i}] {doc.document_name} (Page {doc.page_number or 'N/A'}):\n{doc.text[:800]}"
             )
@@ -322,13 +318,12 @@ class RAGNodes:
             result = self.llm.generate(
                 system_prompt=RESPONDER_SYSTEM_PROMPT,
                 user_prompt=prompt,
-                temperature=0.4,  
+                temperature=0.4,
                 max_tokens=2048,
             )
 
             answer = result["text"].strip()
 
-            # NO CITATIONS — always empty
             state["answer"] = answer
             state["citations"] = []
             state["generation_metadata"] = {

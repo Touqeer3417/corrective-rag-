@@ -133,6 +133,16 @@ class Settings(BaseSettings):
         return v
 
     # -----------------------------------------------------------------------
+    # Caching (Redis + In-Memory)  -- NEW
+    # -----------------------------------------------------------------------
+    redis_url: Optional[str] = Field(default=None, alias="REDIS_URL")
+    cache_enabled: bool = Field(default=True, alias="CACHE_ENABLED")
+    cache_embedding_ttl: int = Field(default=86400, alias="CACHE_EMBEDDING_TTL")      # 24h
+    cache_retrieval_ttl: int = Field(default=3600, alias="CACHE_RETRIEVAL_TTL")       # 1h
+    cache_grade_ttl: int = Field(default=3600, alias="CACHE_GRADE_TTL")               # 1h
+    cache_answer_ttl: int = Field(default=1800, alias="CACHE_ANSWER_TTL")             # 30m
+
+    # -----------------------------------------------------------------------
     # Helper properties
     # -----------------------------------------------------------------------
     @property
@@ -169,7 +179,6 @@ class Settings(BaseSettings):
         if self.llm_provider == "groq":
             return self.groq_model
         return self.local_llm_model
-
 
 @lru_cache()
 def get_settings() -> Settings:
