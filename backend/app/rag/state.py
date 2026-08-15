@@ -19,6 +19,7 @@ class RAGState(TypedDict):
         max_retries: Maximum allowed retries
         retrieval_score: Average relevance score from grader
         relevance_scores: Individual relevance scores
+        grading_metadata: Metadata from batched grading (LLM calls, fallback, details)
         answer: Generated answer text
         citations: Structured citations for the answer
         generation_metadata: LLM usage metadata (tokens, latency, model)
@@ -41,6 +42,7 @@ class RAGState(TypedDict):
     # Grading
     retrieval_score: Optional[float]
     relevance_scores: List[float]
+    grading_metadata: Dict[str, Any]  # NEW: tracks batched grading metrics
 
     # Output
     answer: Optional[str]
