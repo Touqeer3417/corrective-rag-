@@ -94,21 +94,7 @@ class CRAGGraph:
         logger.info("CRAG LangGraph compiled successfully")
         return compiled
 
-    # ======================================================================
-    # PRODUCTION FIX: Prepare graph for streaming
-    # ======================================================================
-    # The prepare graph runs the FULL CRAG pipeline EXCLUDING the responder
-    # (generate_answer) node. This means:
-    #   - Retrieval, grading, reranking, and corrective loops all run
-    #   - NO LLM generation call is made
-    #   - The returned state contains reranked_documents ready for streaming
-    #
-    # This fixes the double-LLM-call bug in chat_stream() where:
-    #   BEFORE: crag.invoke() → LLM call #1 (generation, discarded)
-    #           → rebuild context → LLM call #2 (generate_stream)
-    #   AFTER:  crag.prepare() → NO LLM generation
-    #           → generate_stream() → ONE LLM call only
-    # ======================================================================
+
     def _build_prepare_graph(self):
         """Build graph that runs retrieval/grading/reranking WITHOUT generation."""
         builder = StateGraph(RAGState)
