@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Brain, Zap, Sparkles, ChevronRight } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Brain, Zap, Sparkles } from 'lucide-react';
 
 interface SplashScreenProps {
   onComplete: () => void;

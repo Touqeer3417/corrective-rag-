@@ -6,7 +6,6 @@ import {
   LayoutDashboard,
   Upload,
   Brain,
-  Activity,
   ChevronRight
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';

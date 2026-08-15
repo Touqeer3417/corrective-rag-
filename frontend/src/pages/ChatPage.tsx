@@ -17,6 +17,7 @@ export default function ChatPage() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<number>(0);
 
+  
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [answer, citations]);

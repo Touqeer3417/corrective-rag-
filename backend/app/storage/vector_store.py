@@ -1,4 +1,6 @@
-"""Qdrant vector store implementation."""
+"""Qdrant vector store — Server OR Local mode (no server needed)."""
+import uuid  # ← YEH ADD KARO
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -17,26 +19,57 @@ from app.schemas.document import DocumentChunk
 
 logger = get_logger("storage.vector")
 
+
 class VectorStore:
-    """Qdrant-backed vector store with ANN search."""
+    """Qdrant vector store with ANN search.
+    
+    SMART: Pehle server dhundta hai (Docker/production).
+    Agar server nahi mile -> LOCAL mode (embedded, no server needed).
+    """
 
     def __init__(self):
         self.settings = get_settings()
+        self.collection_name = self.settings.qdrant_collection
+        self._dimension: Optional[int] = None
+        
+        # Pehle server try karo, nahi chal raha tu local mode
+        self.client = self._connect()
+        self._init_collection()
+
+    def _connect(self) -> QdrantClient:
+        """Server pehle, phir local fallback."""
+        
+        # --- Try 1: Qdrant Server (Docker) ---
         try:
-            self.client = QdrantClient(
+            client = QdrantClient(
                 host=self.settings.qdrant_host,
                 port=self.settings.qdrant_port,
                 api_key=self.settings.qdrant_api_key or None,
+                timeout=3,
             )
-            self.collection_name = self.settings.qdrant_collection
-            self._dimension: Optional[int] = None
-            self._init_collection()
+            client.get_collections()  # Test connection
+            logger.info(
+                f"Qdrant SERVER connected: "
+                f"{self.settings.qdrant_host}:{self.settings.qdrant_port}"
+            )
+            return client
         except Exception as e:
-            logger.error(f"Failed to connect to Qdrant: {e}")
-            raise
+            logger.warning(
+                f"Qdrant server nahi mila ({self.settings.qdrant_host}:"
+                f"{self.settings.qdrant_port}). Local mode use kar raha hun. "
+                f"Error: {e}"
+            )
+
+        # --- Try 2: Local Mode (NO SERVER NEEDED) ---
+        local_path = Path(self.settings.bm25_index_path).parent / "qdrant_local"
+        local_path.mkdir(parents=True, exist_ok=True)
+        
+        client = QdrantClient(path=str(local_path))
+        logger.info(f"Qdrant LOCAL mode ON. Data: {local_path}")
+        return client
 
     def _init_collection(self) -> None:
-        """Check existing collection and get dimension."""
+        """Check collection exists."""
         try:
             collections = self.client.get_collections().collections
             exists = any(c.name == self.collection_name for c in collections)
@@ -45,19 +78,18 @@ class VectorStore:
                 info = self.client.get_collection(self.collection_name)
                 self._dimension = info.config.params.vectors.size
                 logger.info(
-                    f"Connected to Qdrant collection '{self.collection_name}' "
-                    f"(dim={self._dimension})"
+                    f"Collection '{self.collection_name}' ready "
+                    f"(dim={self._dimension}, total_vectors={self.count})"
                 )
             else:
                 logger.info(
-                    f"Qdrant collection '{self.collection_name}' not found. "
-                    f"Will create on first upsert."
+                    f"Collection '{self.collection_name}' nahi milli. "
+                    f"Pehli upload pe ban jayegi."
                 )
         except Exception as e:
-            logger.warning(f"Could not check Qdrant collections: {e}")
+            logger.warning(f"Collection check failed: {e}")
 
     def _create_collection(self, dimension: int) -> None:
-        """Create collection with given dimension."""
         try:
             self.client.create_collection(
                 collection_name=self.collection_name,
@@ -65,11 +97,10 @@ class VectorStore:
             )
             self._dimension = dimension
             logger.info(
-                f"Created Qdrant collection '{self.collection_name}' "
-                f"with dimension {dimension}"
+                f"Collection '{self.collection_name}' created (dim={dimension})"
             )
         except Exception as e:
-            logger.error(f"Failed to create Qdrant collection: {e}")
+            logger.error(f"Collection create failed: {e}")
             raise
 
     def upsert_chunks(
@@ -80,8 +111,7 @@ class VectorStore:
 
         if len(chunks) != len(embeddings):
             raise ValueError(
-                f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) "
-                f"must have same length"
+                f"chunks ({len(chunks)}) != embeddings ({len(embeddings)})"
             )
 
         dimension = len(embeddings[0])
@@ -94,8 +124,8 @@ class VectorStore:
                 self._create_collection(dimension)
             elif self._dimension is not None and dimension != self._dimension:
                 logger.warning(
-                    f"Dimension mismatch: existing={self._dimension}, new={dimension}. "
-                    f"Recreating collection."
+                    f"Dimension badal gayi ({self._dimension} -> {dimension}). "
+                    f"Collection dobara bana raha hun."
                 )
                 self.client.delete_collection(self.collection_name)
                 self._create_collection(dimension)
@@ -106,16 +136,17 @@ class VectorStore:
             for chunk, emb in zip(chunks, embeddings):
                 if len(emb) != dimension:
                     raise ValueError(
-                        f"Inconsistent embedding dimension: expected {dimension}, "
-                        f"got {len(emb)}"
+                        f"Wrong dimension: expected {dimension}, got {len(emb)}"
                     )
                 
+                # ← FIX: Qdrant ko valid UUID chahiye point ID ke liye
+                # Asli chunk_id payload mein save hoti hai
                 points.append(
                     PointStruct(
-                        id=chunk.chunk_id,
+                        id=str(uuid.uuid4()),  # ← NAYA UUID for Qdrant
                         vector=emb,
                         payload={
-                            "chunk_id": chunk.chunk_id,
+                            "chunk_id": chunk.chunk_id,  # ← Asli ID yahan
                             "document_id": chunk.document_id,
                             "document_name": chunk.document_name,
                             "file_type": chunk.file_type,
@@ -134,7 +165,7 @@ class VectorStore:
             )
             logger.info(f"Upserted {len(points)} vectors to Qdrant")
         except Exception as e:
-            logger.error(f"Failed to upsert chunks to Qdrant: {e}")
+            logger.error(f"Upsert failed: {e}")
             raise
 
     def search(
@@ -146,12 +177,11 @@ class VectorStore:
         try:
             collections = self.client.get_collections().collections
             if not any(c.name == self.collection_name for c in collections):
-                logger.warning("Qdrant collection does not exist, returning no results")
+                logger.warning("Collection nahi hai, kuch nahi mila")
                 return []
 
             query_filter = None
             if document_ids:
-                # "should" = OR logic: document_id matches any of the given ids
                 query_filter = Filter(
                     should=[
                         FieldCondition(
@@ -189,7 +219,7 @@ class VectorStore:
             logger.info(f"Qdrant search returned {len(chunks)} results")
             return chunks
         except Exception as e:
-            logger.error(f"Qdrant search failed: {e}")
+            logger.error(f"Search failed: {e}")
             return []
 
     def delete_by_document(self, document_id: str) -> int:
@@ -210,10 +240,10 @@ class VectorStore:
                 ),
                 wait=True,
             )
-            logger.info(f"Deleted vectors for document {document_id} from Qdrant")
+            logger.info(f"Deleted vectors for document {document_id}")
             return 1
         except Exception as e:
-            logger.error(f"Failed to delete vectors from Qdrant: {e}")
+            logger.error(f"Delete failed: {e}")
             return 0
 
     def clear(self) -> None:
@@ -221,10 +251,10 @@ class VectorStore:
             collections = self.client.get_collections().collections
             if any(c.name == self.collection_name for c in collections):
                 self.client.delete_collection(self.collection_name)
-                logger.info(f"Deleted Qdrant collection '{self.collection_name}'")
+                logger.info(f"Collection '{self.collection_name}' deleted")
             self._dimension = None
         except Exception as e:
-            logger.error(f"Failed to clear Qdrant collection: {e}")
+            logger.error(f"Clear failed: {e}")
 
     @property
     def dimension(self) -> Optional[int]:
@@ -239,7 +269,7 @@ class VectorStore:
             result = self.client.count(self.collection_name)
             return result.count
         except Exception as e:
-            logger.warning(f"Could not get Qdrant count: {e}")
+            logger.warning(f"Count failed: {e}")
             return 0
 
 
