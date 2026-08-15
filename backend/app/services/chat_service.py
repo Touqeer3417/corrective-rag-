@@ -1,17 +1,25 @@
 """Chat and RAG orchestration service."""
 import asyncio
 import json
-import queue
 from typing import AsyncGenerator
 
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.rag.graph import get_crag_graph
 from app.rag.models import get_llm_provider
-from app.rag.prompts import RESPONDER_SYSTEM_PROMPT, RESPONDER_USER_TEMPLATE
+from app.rag.prompts import (
+    RESPONDER_SYSTEM_PROMPT,
+    RESPONDER_USER_TEMPLATE,
+    INSUFFICIENT_EVIDENCE_MESSAGE,
+)
 from app.schemas.chat import ChatResponse
 
 logger = get_logger("services.chat")
+
+
+def _sse(data: dict) -> str:
+    """Build an SSE event line from a dict."""
+    return f"data: {json.dumps(data)}\n\n"
 
 
 class ChatService:
@@ -47,73 +55,97 @@ class ChatService:
             )
 
     async def chat_stream(self, question: str) -> AsyncGenerator[str, None]:
-        """Streaming chat response via SSE — fully async, event loop block nahi hota."""
+        """Streaming chat response via SSE — true async token streaming.
+
+        PRODUCTION FIX:
+        - Runs CRAG retrieval/grading/reranking ONCE via prepare() (NO LLM call)
+        - Streams answer generation via generate_stream() — exactly ONE LLM call
+        - First SSE token sent as soon as generation starts
+        - No duplicate LLM calls, no discarded answers, no blocking before stream
+        """
         try:
-            # Run blocking CRAG invoke in thread pool
-            result = await asyncio.to_thread(self.crag.invoke, question)
+            # ------------------------------------------------------------------
+            # STEP 1: Run CRAG pipeline up to reranking (NO generation LLM call)
+            # ------------------------------------------------------------------
+            result = await asyncio.to_thread(self.crag.prepare, question)
             docs = result.get("reranked_documents", [])
-            answer = result.get("answer", "")
             retry_count = result.get("retry_count", 0)
+            max_retries = result.get("max_retries", 2)
+            retrieval_score = result.get("retrieval_score", 0) or 0.0
             transformed_query = result.get("transformed_query")
 
-            # Agar insufficient evidence hai ya koi doc nahi — seedha answer bhejo
-            if not docs or result.get("generation_metadata", {}).get("insufficient_evidence"):
-                safe_answer = json.dumps(answer)
-                yield f'data: {{"type": "token", "content": {safe_answer}}}\n\n'
-                yield f'data: {{"type": "done"}}\n\n'
+            # ------------------------------------------------------------------
+            # STEP 2: Check for insufficient evidence (same logic as generate_answer)
+            # ------------------------------------------------------------------
+            if not docs or (retrieval_score < 0.2 and retry_count >= max_retries):
+                yield _sse({"type": "token", "content": INSUFFICIENT_EVIDENCE_MESSAGE})
+                yield _sse({"type": "done"})
                 return
 
-            # Context build karo
+            # ------------------------------------------------------------------
+            # STEP 3: Build prompt from reranked documents (same as generate_answer)
+            # ------------------------------------------------------------------
             context_parts = []
             for i, doc in enumerate(docs[:8], 1):
                 context_parts.append(
-                    f"[Document {i}] {doc.document_name} (Page {doc.page_number or 'N/A'}):\n{doc.text[:1000]}"
+                    f"[Document {i}] {doc.document_name} (Page {doc.page_number or 'N/A'}):\n{doc.text[:800]}"
                 )
             context = "\n\n".join(context_parts)
             prompt = RESPONDER_USER_TEMPLATE.format(context=context, question=question)
 
-            # --- Async LLM Streaming via Thread Pool + Queue ---
-            # Yeh pattern ensure karta hai ke har token generation event loop ko block NA kare
-            token_q: queue.Queue = queue.Queue()
+            # ------------------------------------------------------------------
+            # STEP 4: Stream LLM generation — true async, first token immediately
+            # ------------------------------------------------------------------
+            # Use asyncio.Queue to bridge blocking generator to async stream.
+            # The blocking generate_stream() runs in a thread, pushing tokens
+            # to the async queue. The event loop yields them immediately.
+            loop = asyncio.get_running_loop()
+            token_queue: asyncio.Queue = asyncio.Queue()
 
-            def _generate_tokens():
-                """Blocking LLM stream — runs in separate thread."""
+            def _generate_in_thread():
+                """Run blocking LLM.generate_stream() in background thread."""
                 try:
                     for token in self.llm.generate_stream(
                         system_prompt=RESPONDER_SYSTEM_PROMPT,
                         user_prompt=prompt,
-                        temperature=0.1,
+                        temperature=0.6,  # Match generate_answer node
                         max_tokens=2048,
                     ):
-                        token_q.put(token)
-                    token_q.put(None)  # Sentinel: done
+                        loop.call_soon_threadsafe(token_queue.put_nowait, token)
+                    loop.call_soon_threadsafe(token_queue.put_nowait, None)
                 except Exception as exc:
-                    token_q.put(exc)  # Sentinel: error
+                    loop.call_soon_threadsafe(token_queue.put_nowait, exc)
 
-            # Background thread mein generation start karo
-            asyncio.create_task(asyncio.to_thread(_generate_tokens))
+            # Start generation in thread pool (non-blocking for event loop)
+            asyncio.create_task(asyncio.to_thread(_generate_in_thread))
 
-            # Async yield tokens as they arrive
+            # Yield tokens as they arrive — first token sent immediately
             while True:
-                token = await asyncio.to_thread(token_q.get)
+                token = await token_queue.get()
                 if token is None:
                     break
                 if isinstance(token, Exception):
                     raise token
 
-                safe_token = json.dumps(token)
-                yield f'data: {{"type": "token", "content": {safe_token}}}\n\n'
+                yield _sse({"type": "token", "content": token})
 
-            # Metadata bhejo
-            safe_query = json.dumps(transformed_query) if transformed_query else "null"
-            yield f'data: {{"type": "metadata", "data": {{"retry_count": {retry_count}, "transformed_query": {safe_query}}}}}\n\n'
-            yield f'data: {{"type": "done"}}\n\n'
+            # ------------------------------------------------------------------
+            # STEP 5: Send metadata and done signal
+            # ------------------------------------------------------------------
+            yield _sse({
+                "type": "metadata",
+                "data": {
+                    "retry_count": retry_count,
+                    "transformed_query": transformed_query,
+                    "retrieval_score": round(retrieval_score, 3),
+                },
+            })
+            yield _sse({"type": "done"})
 
         except Exception as e:
             logger.error(f"Stream error: {e}")
-            error_msg = json.dumps(f"Error: {str(e)}")
-            yield f'data: {{"type": "error", "content": {error_msg}}}\n\n'
-            yield f'data: {{"type": "done"}}\n\n'
+            yield _sse({"type": "error", "content": f"Error: {str(e)}"})
+            yield _sse({"type": "done"})
 
 
 def get_chat_service() -> ChatService:
