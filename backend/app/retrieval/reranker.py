@@ -1,4 +1,4 @@
-"""Cross-encoder reranker using local BGE reranker model."""
+"""Cross-encoder reranker using local BGE reranker model — WITH FAST PATH."""
 from typing import List, Optional
 
 from sentence_transformers import CrossEncoder
@@ -11,10 +11,19 @@ logger = get_logger("retrieval.reranker")
 
 
 class Reranker:
-    """Cross-encoder reranker for precise relevance scoring."""
+    """Cross-encoder reranker for precise relevance scoring — WITH FAST PATH."""
 
     def __init__(self):
         settings = get_settings()
+        self.enabled = getattr(settings, "reranker_enabled", True)
+        self.skip_threshold = getattr(settings, "reranker_skip_threshold", 0.75)
+
+        if not self.enabled:
+            logger.info("Reranker DISABLED in config — skipping cross-encoder loading")
+            self.model = None
+            self.batch_size = 16
+            return
+
         logger.info(f"Loading reranker: {settings.reranker_model} on {settings.reranker_device}")
         self.model = CrossEncoder(
             settings.reranker_model,
@@ -24,6 +33,25 @@ class Reranker:
         self.batch_size = settings.reranker_batch_size
         logger.info("Reranker loaded successfully")
 
+    def should_rerank(self, chunks: List[DocumentChunk]) -> bool:
+        """Fast check: if docs already have very high scores, skip slow cross-encoder."""
+        if not self.enabled or not chunks:
+            return False
+
+        # If average score is already high, cross-encoder won't change much
+        scores = [c.score for c in chunks if c.score is not None]
+        if not scores:
+            return True
+
+        avg_score = sum(scores) / len(scores)
+        if avg_score >= self.skip_threshold:
+            logger.info(
+                f"[RERANKER] SKIP — avg hybrid score {avg_score:.3f} >= threshold "
+                f"{self.skip_threshold:.3f}. Saving ~{len(chunks) * 150}ms cross-encoder time."
+            )
+            return False
+        return True
+
     def rerank(
         self,
         query: str,
@@ -32,11 +60,19 @@ class Reranker:
     ) -> List[DocumentChunk]:
         """Rerank chunks by cross-encoder relevance score.
 
-        Returns:
-            Top-k reranked chunks with updated scores
+        PRODUCTION: Skips cross-encoder if hybrid scores are already excellent.
+        Returns: Top-k reranked chunks with updated scores
         """
         if not chunks:
             return []
+
+        # ------------------------------------------------------------------
+        # FAST PATH: Skip expensive cross-encoder when confidence is high
+        # ------------------------------------------------------------------
+        if not self.should_rerank(chunks):
+            # Just sort by existing score and trim
+            ranked = sorted(chunks, key=lambda x: x.score or 0.0, reverse=True)
+            return ranked[:top_k]
 
         logger.info(f"Reranking {len(chunks)} chunks for query: {query[:50]}...")
 
@@ -58,7 +94,6 @@ class Reranker:
         ranked = sorted(chunks, key=lambda x: x.score or 0.0, reverse=True)
         top_results = ranked[:top_k]
 
-        # Fixed: f-string mein if-else alag se handle karo
         if top_results:
             logger.info(f"Reranker top score: {top_results[0].score:.3f}")
         else:

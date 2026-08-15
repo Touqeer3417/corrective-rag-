@@ -37,9 +37,12 @@ def decide_after_grading(state: RAGState) -> Literal["reranker", "transform_quer
     """Decide next step after document grading.
 
     Routes:
-        - reranker: Good relevance, proceed to generation
-        - transform_query: Poor relevance, attempt corrective retrieval
-        - responder: Max retries reached or insufficient evidence
+    - reranker: Good relevance, proceed to generation
+    - transform_query: Poor relevance, attempt corrective retrieval
+    - responder: Max retries reached or insufficient evidence
+
+    PRODUCTION FIX: More aggressive thresholds to avoid expensive corrective loops.
+    Each loop costs 1 LLM call + 1 retrieval (~5-8 seconds).
     """
     try:
         # SAFE defaults — agar config mein missing ho toh bhi crash nahi hoga
@@ -48,35 +51,54 @@ def decide_after_grading(state: RAGState) -> Literal["reranker", "transform_quer
         max_retries = state.get("max_retries", 2)
         graded_docs = state.get("graded_documents", [])
 
-        # Thresholds with safe defaults
-        high_threshold = 0.6
-        low_threshold = 0.3
+        # Thresholds with safe defaults — HIGHER to avoid loops
+        high_threshold = 0.65
+        low_threshold = 0.40
         try:
             settings = get_settings()
-            high_threshold = getattr(settings, "relevance_threshold_high", 0.6)
-            low_threshold = getattr(settings, "relevance_threshold_low", 0.3)
-            max_retries = state.get("max_retries", getattr(settings, "max_retries", 2))
+            high_threshold = getattr(settings, "relevance_threshold_high", 0.65)
+            low_threshold = getattr(settings, "relevance_threshold_low", 0.40)
+            max_retries = state.get("max_retries", getattr(settings, "max_retries", 1))
         except Exception as cfg_err:
             logger.warning(f"[EDGE] Config read failed, using defaults: {cfg_err}")
 
-        logger.info(f"[EDGE] Grading decision: score={retrieval_score:.3f}, retry={retry_count}/{max_retries}")
+        logger.info(
+            f"[EDGE] Grading decision: score={retrieval_score:.3f}, "
+            f"retry={retry_count}/{max_retries}, docs={len(graded_docs)}"
+        )
 
-        # High relevance: proceed to rerank
+        # ------------------------------------------------------------------
+        # HIGH relevance: proceed to rerank (no corrective loop)
+        # ------------------------------------------------------------------
         if retrieval_score >= high_threshold and graded_docs:
+            logger.info(f"[EDGE] High relevance ({retrieval_score:.3f}) → reranker")
             return "reranker"
 
-        # Low relevance but retries remaining: corrective path
+        # ------------------------------------------------------------------
+        # LOW relevance BUT retries remaining: corrective path
+        # PRODUCTION: Only transform if we have SOME docs and score is marginal.
+        # If score is extremely low (<0.15) or no docs, skip transform and
+        # go straight to responder — transform won't help.
+        # ------------------------------------------------------------------
         if retrieval_score < low_threshold and retry_count < max_retries:
-            logger.info(f"[EDGE] Low relevance ({retrieval_score:.3f}), routing to transform_query")
+            if not graded_docs or retrieval_score < 0.15:
+                logger.warning(
+                    f"[EDGE] Score too low ({retrieval_score:.3f}) and no docs — "
+                    f"skipping transform, going to responder"
+                )
+                return "responder"
+            logger.info(f"[EDGE] Low relevance ({retrieval_score:.3f}) → transform_query")
             return "transform_query"
 
-        # Marginal relevance or max retries: proceed with what we have
+        # ------------------------------------------------------------------
+        # MARGINAL relevance or max retries: proceed with what we have
+        # ------------------------------------------------------------------
         if graded_docs:
-            logger.info(f"[EDGE] Proceeding to reranker with {len(graded_docs)} docs")
+            logger.info(f"[EDGE] Marginal relevance → reranker with {len(graded_docs)} docs")
             return "reranker"
 
         # No documents at all after max retries
-        logger.warning("[EDGE] No relevant documents after grading, routing to responder")
+        logger.warning("[EDGE] No relevant documents after grading → responder")
         return "responder"
     except Exception as e:
         logger.error(f"[EDGE] decide_after_grading crashed: {e}")

@@ -1,4 +1,4 @@
-"""LangGraph node implementations for CRAG workflow WITH CACHING."""
+"""LangGraph node implementations for CRAG workflow WITH CACHING + SPEED OPTIMIZATIONS."""
 import hashlib
 import json
 from typing import List, Optional
@@ -86,6 +86,7 @@ class RAGNodes:
         emb_threshold = settings.grade_embedding_threshold
         fast_path = settings.grade_fast_path_enabled
         fast_threshold = settings.grade_fast_path_threshold
+        grade_max_tokens = getattr(settings, "grade_max_tokens", 1024)
 
         # ======================================================================
         # TIER 1: Embedding Similarity Pre-Filter
@@ -269,7 +270,7 @@ class RAGNodes:
                 system_prompt=BATCH_GRADER_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 temperature=0.0,
-                max_tokens=2048,
+                max_tokens=grade_max_tokens,
                 json_mode=True,
             )
 
@@ -386,19 +387,39 @@ class RAGNodes:
         return state
 
     # ========================================================================
-    # NODE: Transform Query
+    # NODE: Transform Query  (HEURISTIC FAST PATH ADDED)
     # ========================================================================
     def transform_query(self, state: RAGState) -> RAGState:
-        """Node: Query transformation for corrective retrieval."""
+        """Node: Query transformation for corrective retrieval.
+        
+        PRODUCTION FIX: Uses heuristic expansion first (FREE, <10ms).
+        Only falls back to LLM rewrite on 2nd+ retry or when heuristic is disabled.
+        """
         question = state["original_question"]
         current_transformed = state.get("transformed_query")
+        retry_count = state.get("retry_count", 0)
+        settings = get_settings()
+        use_heuristic = getattr(settings, "transform_heuristic_first", True)
 
+        # ------------------------------------------------------------------
+        # FAST PATH: Heuristic expansion (no LLM call, instant)
+        # ------------------------------------------------------------------
+        if use_heuristic and retry_count == 0 and not current_transformed:
+            # Simple keyword expansion — adds domain context without LLM latency
+            expanded = self._heuristic_expand(question)
+            if expanded != question:
+                state["transformed_query"] = expanded
+                state["retry_count"] = retry_count + 1
+                logger.info(f"[TRANSFORM] HEURISTIC fast path: {expanded[:60]}...")
+                return state
+
+        # LLM-based rewrite (slower, but more intelligent)
         if current_transformed:
             prompt = f"The previous query rewrite did not yield good results. Original: {question}. Previous rewrite: {current_transformed}. Generate a different, more specific search query."
         else:
             prompt = TRANSFORM_USER_TEMPLATE.format(question=question)
 
-        logger.info(f"[TRANSFORM] Rewriting query: {question[:60]}...")
+        logger.info(f"[TRANSFORM] LLM rewrite: {question[:60]}...")
 
         try:
             result = self.llm.generate(
@@ -409,20 +430,52 @@ class RAGNodes:
             )
             transformed = result["text"].strip().strip('"').strip("'")
             state["transformed_query"] = transformed
-            state["retry_count"] = state.get("retry_count", 0) + 1
+            state["retry_count"] = retry_count + 1
             logger.info(f"[TRANSFORM] New query: {transformed[:60]}...")
         except Exception as e:
             logger.error(f"Query transformation failed: {e}")
             state["transformed_query"] = f"{question} company policy procedure"
-            state["retry_count"] = state.get("retry_count", 0) + 1
+            state["retry_count"] = retry_count + 1
 
         return state
 
+    def _heuristic_expand(self, query: str) -> str:
+        """Fast heuristic query expansion — no LLM needed."""
+        q = query.strip().lower()
+
+        # If already keyword-rich and long, return as-is
+        if len(q.split()) >= 6:
+            return query
+
+        # Expand common abbreviations and add domain context
+        expansions = []
+        if "hr" in q.split() or "hr " in q:
+            expansions.append("human resources")
+        if "it" in q.split():
+            expansions.append("information technology")
+        if "ceo" in q:
+            expansions.append("chief executive officer")
+        if "cfo" in q:
+            expansions.append("chief financial officer")
+
+        # Add domain boosters for short queries
+        boosters = ["company policy", "procedure", "guidelines"]
+        # Only add if not already present
+        for b in boosters:
+            if b not in q:
+                expansions.append(b)
+                break  # Just add one to keep it concise
+
+        if expansions:
+            return f"{query} {' '.join(expansions)}"
+
+        return query
+
     # ========================================================================
-    # NODE: Rerank Documents
+    # NODE: Rerank Documents  (FAST PATH — skip cross-encoder when confident)
     # ========================================================================
     def rerank_documents(self, state: RAGState) -> RAGState:
-        """Node: Cross-encoder reranking."""
+        """Node: Cross-encoder reranking — WITH FAST PATH."""
         docs = state.get("graded_documents", [])
         question = state.get("transformed_query") or state["question"]
         settings = get_settings()
@@ -432,7 +485,27 @@ class RAGNodes:
             state["reranked_documents"] = []
             return state
 
-        logger.info(f"[RERANKER] Reranking {len(docs)} documents")
+        # ------------------------------------------------------------------
+        # PRODUCTION FIX: Skip slow cross-encoder if graded docs are already
+        # high quality. This saves 3-5 seconds on CPU per query.
+        # ------------------------------------------------------------------
+        if not self.reranker.enabled:
+            logger.info("[RERANKER] Disabled in config — passing through graded docs")
+            state["reranked_documents"] = sorted(
+                docs, key=lambda x: x.score or 0.0, reverse=True
+            )[:settings.top_k_rerank]
+            return state
+
+        if not self.reranker.should_rerank(docs):
+            # Fast path: already good scores from hybrid + grading
+            state["reranked_documents"] = sorted(
+                docs, key=lambda x: x.score or 0.0, reverse=True
+            )[:settings.top_k_rerank]
+            top_score = state["reranked_documents"][0].score if state["reranked_documents"] else 0
+            logger.info(f"[RERANKER] Fast pass — top score: {top_score:.3f}")
+            return state
+
+        logger.info(f"[RERANKER] Running cross-encoder on {len(docs)} documents")
 
         try:
             reranked = self.reranker.rerank(
@@ -447,7 +520,7 @@ class RAGNodes:
                 docs, key=lambda x: x.score or 0.0, reverse=True
             )[:settings.top_k_rerank]
 
-        top_score = state['reranked_documents'][0].score if state['reranked_documents'] else 0
+        top_score = state["reranked_documents"][0].score if state["reranked_documents"] else 0
         logger.info(f"[RERANKER] Top score: {top_score:.3f}")
         return state
 

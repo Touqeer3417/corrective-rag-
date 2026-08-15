@@ -91,9 +91,11 @@ class Settings(BaseSettings):
         return v.lower()
 
     # Reranker
+    reranker_enabled: bool = Field(default=True, alias="RERANKER_ENABLED")
     reranker_model: str = Field(default="BAAI/bge-reranker-base", alias="RERANKER_MODEL")
     reranker_device: str = Field(default="cpu", alias="RERANKER_DEVICE")
     reranker_batch_size: int = Field(default=16, alias="RERANKER_BATCH_SIZE")
+    reranker_skip_threshold: float = Field(default=0.75, alias="RERANKER_SKIP_THRESHOLD")
 
     # Qdrant
     qdrant_host: str = Field(default="localhost", alias="QDRANT_HOST")
@@ -113,24 +115,28 @@ class Settings(BaseSettings):
     max_batch_size_mb: int = Field(default=200, alias="MAX_BATCH_SIZE_MB")
 
     # RAG
-    max_retries: int = Field(default=2, alias="MAX_RETRIES")
+    max_retries: int = Field(default=1, alias="MAX_RETRIES")
     top_k_hybrid: int = Field(default=50, alias="TOP_K_HYBRID")
     top_k_rerank: int = Field(default=10, alias="TOP_K_RERANK")
     rrf_k: int = Field(default=60, alias="RRF_K")
     relevance_threshold_high: float = Field(default=0.7, alias="RELEVANCE_THRESHOLD_HIGH")
-    relevance_threshold_low: float = Field(default=0.4, alias="RELEVANCE_THRESHOLD_LOW")
+    relevance_threshold_low: float = Field(default=0.45, alias="RELEVANCE_THRESHOLD_LOW")
     chunk_size: int = Field(default=350, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
 
     # -----------------------------------------------------------------------
-    # GRADING OPTIMIZATION (NEW — Production 3-Tier Grading)
+    # SPEED OPTIMIZATION (NEW — Production Speed Settings)
     # -----------------------------------------------------------------------
+    hybrid_parallel: bool = Field(default=True, alias="HYBRID_PARALLEL")
     grade_max_docs_per_batch: int = Field(default=8, alias="GRADE_MAX_DOCS_PER_BATCH")
     grade_max_chars_per_doc: int = Field(default=400, alias="GRADE_MAX_CHARS_PER_DOC")
     grade_embedding_pre_filter: bool = Field(default=True, alias="GRADE_EMBEDDING_PRE_FILTER")
     grade_embedding_threshold: float = Field(default=0.20, alias="GRADE_EMBEDDING_THRESHOLD")
     grade_fast_path_enabled: bool = Field(default=True, alias="GRADE_FAST_PATH_ENABLED")
     grade_fast_path_threshold: float = Field(default=0.90, alias="GRADE_FAST_PATH_THRESHOLD")
+    grade_max_tokens: int = Field(default=1024, alias="GRADE_MAX_TOKENS")
+    transform_heuristic_first: bool = Field(default=True, alias="TRANSFORM_HEURISTIC_FIRST")
+    warmup_on_startup: bool = Field(default=True, alias="WARMUP_ON_STARTUP")
 
     # Security
     allowed_extensions: list = Field(default=["pdf", "docx", "txt", "md"], alias="ALLOWED_EXTENSIONS")

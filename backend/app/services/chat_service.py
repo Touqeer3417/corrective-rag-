@@ -1,4 +1,4 @@
-"""Chat and RAG orchestration service WITH ANSWER CACHING."""
+"""Chat and RAG orchestration service WITH ANSWER CACHING + SPEED OPTIMIZATIONS."""
 import asyncio
 import json
 from typing import AsyncGenerator
@@ -17,9 +17,11 @@ from app.schemas.chat import ChatResponse
 
 logger = get_logger("services.chat")
 
+
 def _sse(data: dict) -> str:
     """Build an SSE event line from a dict."""
     return f"data: {json.dumps(data)}\n\n"
+
 
 class ChatService:
     """Handle chat queries and streaming responses WITH CACHING."""
@@ -33,10 +35,10 @@ class ChatService:
         """Async chat with full CRAG pipeline via thread pool + caching."""
         settings = get_settings()
         use_cache = getattr(settings, "cache_enabled", True)
-        
+
         # Try answer cache first
+        cache_key = _make_key("chat_answer", question.strip().lower())
         if use_cache:
-            cache_key = _make_key("chat_answer", question.strip().lower())
             cached = self._answer_cache.get(cache_key)
             if cached is not None:
                 logger.info(f"[ANSWER CACHE] HIT for question: {question[:60]}...")
@@ -48,10 +50,10 @@ class ChatService:
                     transformed_query=cached.get("transformed_query"),
                     generation_metadata=cached.get("generation_metadata", {}),
                 )
-        
+
         try:
             result = await asyncio.to_thread(self.crag.invoke, question)
-            
+
             response = ChatResponse(
                 answer=result.get("answer") or "No answer generated.",
                 citations=[],
@@ -60,7 +62,7 @@ class ChatService:
                 transformed_query=result.get("transformed_query"),
                 generation_metadata=result.get("generation_metadata", {}),
             )
-            
+
             # Cache the answer
             if use_cache and response.answer and not response.answer.startswith("I apologize"):
                 cache_value = {
@@ -72,9 +74,9 @@ class ChatService:
                 }
                 self._answer_cache.set(cache_key, cache_value)
                 logger.info(f"[ANSWER CACHE] Stored answer for: {question[:60]}...")
-            
+
             return response
-            
+
         except Exception as e:
             logger.error(f"Chat invocation failed: {e}")
             return ChatResponse(
@@ -90,10 +92,10 @@ class ChatService:
         """Streaming chat response via SSE — with answer caching."""
         settings = get_settings()
         use_cache = getattr(settings, "cache_enabled", True)
-        
+        cache_key = _make_key("chat_answer", question.strip().lower())
+
         # Try answer cache first for streaming too
         if use_cache:
-            cache_key = _make_key("chat_answer", question.strip().lower())
             cached = self._answer_cache.get(cache_key)
             if cached is not None:
                 logger.info(f"[ANSWER CACHE] HIT for stream: {question[:60]}...")
@@ -102,7 +104,7 @@ class ChatService:
                 for word in words:
                     yield _sse({"type": "token", "content": word + " "})
                     await asyncio.sleep(0.01)  # Small delay for natural feel
-                
+
                 yield _sse({
                     "type": "metadata",
                     "data": {
@@ -114,7 +116,13 @@ class ChatService:
                 })
                 yield _sse({"type": "done"})
                 return
-        
+
+        # ------------------------------------------------------------------
+        # PRODUCTION FIX: Emit a "thinking" event immediately so UI doesn't
+        # feel frozen during the 2-5 second retrieval/grading phase.
+        # ------------------------------------------------------------------
+        yield _sse({"type": "status", "content": "Searching documents..."})
+
         try:
             # Step 1: Run CRAG pipeline up to reranking
             result = await asyncio.to_thread(self.crag.prepare, question)
@@ -137,6 +145,8 @@ class ChatService:
                 )
             context = "\n\n".join(context_parts)
             prompt = RESPONDER_USER_TEMPLATE.format(context=context, question=question)
+
+            yield _sse({"type": "status", "content": "Generating answer..."})
 
             # Step 3: Stream LLM generation
             loop = asyncio.get_running_loop()
@@ -198,6 +208,7 @@ class ChatService:
             logger.error(f"Stream error: {e}")
             yield _sse({"type": "error", "content": f"Error: {str(e)}"})
             yield _sse({"type": "done"})
+
 
 def get_chat_service() -> ChatService:
     return ChatService()
