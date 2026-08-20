@@ -213,12 +213,7 @@ export default function ChatPage() {
           )}
 
           {/* Metadata */}
-          {metadata.transformed_query && (
-            <p className="text-xs text-slate-600 italic flex items-center gap-1.5">
-              <span className="w-1 h-1 rounded-full bg-slate-600" />
-              Rewritten query: {metadata.transformed_query}
-            </p>
-          )}
+         
 
           <div ref={bottomRef} />
         </div>
