@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import { DocumentInfo } from '../types/document';
 
+const API_URL =
+  import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
+
 interface DocumentStore {
   documents: DocumentInfo[];
   loading: boolean;
@@ -12,20 +15,34 @@ interface DocumentStore {
 export const useDocumentStore = create<DocumentStore>((set, get) => ({
   documents: [],
   loading: false,
+
   fetchDocuments: async () => {
     set({ loading: true });
+
     try {
-      const res = await fetch('http://localhost:8000/api/v1/documents');
+      const res = await fetch(`${API_URL}/documents`);
       const data = await res.json();
-      set({ documents: data.documents || [], loading: false });
+
+      set({
+        documents: data.documents || [],
+        loading: false,
+      });
     } catch (e) {
       set({ loading: false });
     }
   },
+
   removeDocument: (id) => {
-    set({ documents: get().documents.filter((d) => d.document_id !== id) });
+    set({
+      documents: get().documents.filter(
+        (d) => d.document_id !== id
+      ),
+    });
   },
+
   addDocument: (doc) => {
-    set({ documents: [doc, ...get().documents] });
+    set({
+      documents: [doc, ...get().documents],
+    });
   },
 }));

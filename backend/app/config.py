@@ -98,10 +98,18 @@ class Settings(BaseSettings):
     reranker_skip_threshold: float = Field(default=0.75, alias="RERANKER_SKIP_THRESHOLD")
 
     # Qdrant
+   # Qdrant
+    qdrant_url: Optional[str] = Field(default=None, alias="QDRANT_URL")
     qdrant_host: str = Field(default="localhost", alias="QDRANT_HOST")
     qdrant_port: int = Field(default=6333, alias="QDRANT_PORT")
-    qdrant_collection: str = Field(default="company_documents", alias="QDRANT_COLLECTION")
-    qdrant_api_key: Optional[str] = Field(default=None, alias="QDRANT_API_KEY")
+    qdrant_collection: str = Field(
+        default="company_documents",
+        alias="QDRANT_COLLECTION",
+    )
+    qdrant_api_key: Optional[str] = Field(
+        default=None,
+        alias="QDRANT_API_KEY",
+    )
 
     # BM25
     bm25_index_path: str = Field(default="./data/bm25", alias="BM25_INDEX_PATH")

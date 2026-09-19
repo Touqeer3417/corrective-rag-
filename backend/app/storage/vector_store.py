@@ -37,36 +37,72 @@ class VectorStore:
         self._init_collection()
 
     def _connect(self) -> QdrantClient:
-        """Server pehle, phir local fallback."""
-        
-        # --- Try 1: Qdrant Server (Docker) ---
+        """Connect to Qdrant Cloud or local/server Qdrant."""
+
         try:
-            client = QdrantClient(
-                host=self.settings.qdrant_host,
-                port=self.settings.qdrant_port,
-                api_key=self.settings.qdrant_api_key or None,
-                timeout=3,
-            )
-            client.get_collections()  # Test connection
-            logger.info(
-                f"Qdrant SERVER connected: "
-                f"{self.settings.qdrant_host}:{self.settings.qdrant_port}"
-            )
+            if self.settings.qdrant_url:
+                client = QdrantClient(
+                    url=self.settings.qdrant_url,
+                    api_key=self.settings.qdrant_api_key or None,
+                    timeout=10,
+                )
+
+                target = self.settings.qdrant_url
+
+            else:
+                client = QdrantClient(
+                    host=self.settings.qdrant_host,
+                    port=self.settings.qdrant_port,
+                    api_key=self.settings.qdrant_api_key or None,
+                    timeout=10,
+                )
+
+                target = (
+                    f"{self.settings.qdrant_host}:"
+                    f"{self.settings.qdrant_port}"
+                )
+
+            client.get_collections()
+
+            logger.info(f"Qdrant connected: {target}")
+
             return client
+
         except Exception as e:
+
+            # In production, do NOT silently fall back to
+            # ephemeral local Qdrant.
+            if self.settings.qdrant_url:
+                raise RuntimeError(
+                    f"Could not connect to Qdrant Cloud: {e}"
+                ) from e
+
             logger.warning(
-                f"Qdrant server nahi mila ({self.settings.qdrant_host}:"
-                f"{self.settings.qdrant_port}). Local mode use kar raha hun. "
-                f"Error: {e}"
+                f"Qdrant server unavailable; "
+                f"using local mode. Error: {e}"
             )
 
-        # --- Try 2: Local Mode (NO SERVER NEEDED) ---
-        local_path = Path(self.settings.bm25_index_path).parent / "qdrant_local"
-        local_path.mkdir(parents=True, exist_ok=True)
-        
-        client = QdrantClient(path=str(local_path))
-        logger.info(f"Qdrant LOCAL mode ON. Data: {local_path}")
-        return client
+            local_path = (
+                Path(self.settings.bm25_index_path).parent
+                / "qdrant_local"
+            )
+
+            local_path.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            client = QdrantClient(
+                path=str(local_path)
+            )
+
+            logger.info(
+                f"Qdrant LOCAL mode ON. Data: {local_path}"
+            )
+
+            return client    
+
+   
 
     def _init_collection(self) -> None:
         """Check collection exists."""
