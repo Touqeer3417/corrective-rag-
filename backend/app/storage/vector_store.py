@@ -27,7 +27,7 @@ logger = get_logger("storage.vector")
 QDRANT_BATCH_SIZE = 64
 
 # Timeout for Qdrant Cloud/server operations.
-QDRANT_TIMEOUT_SECONDS = 60
+QDRANT_TIMEOUT_SECONDS = 560
 
 
 class VectorStore:
