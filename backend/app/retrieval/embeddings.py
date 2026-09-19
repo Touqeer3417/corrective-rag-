@@ -90,26 +90,77 @@ class EmbeddingModel:
             return self._encode_openai(texts)
         return self._encode_local(texts, batch_size)
 
-    def _encode_openai(self, texts: List[str]) -> List[List[float]]:
-        """Call OpenAI Embeddings API with automatic batching."""
-        OPENAI_BATCH_LIMIT = 2048
+    def _encode_openai(
+    self,
+    texts: List[str],
+) -> List[List[float]]:
+        """
+        Generate OpenAI embeddings in small batches.
+
+        Small batches reduce:
+        - memory usage
+        - request size
+        - timeout risk
+        - failures on large documents
+        """
+
+        OPENAI_BATCH_SIZE = 64
+
         all_embeddings: List[List[float]] = []
 
-        for i in range(0, len(texts), OPENAI_BATCH_LIMIT):
-            batch = texts[i : i + OPENAI_BATCH_LIMIT]
+        total = len(texts)
+
+        logger.info(
+            f"Generating embeddings for {total} chunks "
+            f"in batches of {OPENAI_BATCH_SIZE}"
+        )
+
+        for start in range(
+            0,
+            total,
+            OPENAI_BATCH_SIZE,
+        ):
+            end = min(
+                start + OPENAI_BATCH_SIZE,
+                total,
+            )
+
+            batch = texts[start:end]
+
             try:
+                logger.info(
+                    f"Embedding chunks "
+                    f"{start + 1}-{end}/{total}"
+                )
+
                 response = self._client.embeddings.create(
                     model=self.model_name,
                     input=batch,
                     encoding_format="float",
                 )
-                batch_embeddings = [item.embedding for item in response.data]
-                all_embeddings.extend(batch_embeddings)
+
+                batch_embeddings = [
+                    item.embedding
+                    for item in response.data
+                ]
+
+                all_embeddings.extend(
+                    batch_embeddings
+                )
+
             except Exception as e:
-                logger.error(f"OpenAI embedding API error: {e}")
+                logger.exception(
+                    f"OpenAI embedding API error "
+                    f"for chunks {start + 1}-{end}: {e}"
+                )
                 raise
 
+        logger.info(
+            f"Generated {len(all_embeddings)} embeddings"
+        )
+
         return all_embeddings
+
 
     def _encode_local(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         """Encode using local sentence-transformers model."""

@@ -1,4 +1,4 @@
-"""Qdrant vector store — Server OR Local mode (no server needed)."""
+"""Qdrant vector store with Cloud, server, and local fallback support."""
 
 import uuid
 from pathlib import Path
@@ -9,6 +9,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    FilterSelector,
     MatchValue,
     PointStruct,
     VectorParams,
@@ -21,56 +22,73 @@ from app.schemas.document import DocumentChunk
 
 logger = get_logger("storage.vector")
 
+# Number of vectors sent to Qdrant in one request.
+# Small batches are safer for low-memory production hosting.
+QDRANT_BATCH_SIZE = 64
+
+# Timeout for Qdrant Cloud/server operations.
+QDRANT_TIMEOUT_SECONDS = 60
+
 
 class VectorStore:
     """
-    Qdrant vector store with ANN search.
+    Qdrant vector store.
 
-    SMART:
-    - First tries Qdrant server / Qdrant Cloud.
-    - If local server is unavailable, falls back to embedded local Qdrant.
-    - If QDRANT_URL is configured (production/cloud), connection failure
-      raises an error instead of silently using ephemeral local storage.
+    Supports:
+    - Qdrant Cloud through QDRANT_URL
+    - Local/server Qdrant through QDRANT_HOST/QDRANT_PORT
+    - Embedded Qdrant fallback for local development
+
+    Large-document optimization:
+    - Vectors are uploaded in small batches instead of one huge request.
     """
 
     def __init__(self):
         self.settings = get_settings()
         self.collection_name = self.settings.qdrant_collection
+
         self._dimension: Optional[int] = None
 
-        # First try Qdrant server/cloud.
-        # If no Qdrant URL is configured and local server is unavailable,
-        # fall back to embedded local Qdrant.
         self.client = self._connect()
 
-        # Check whether the configured collection already exists.
         self._init_collection()
 
+    # ======================================================================
+    # Connection
+    # ======================================================================
+
     def _connect(self) -> QdrantClient:
-        """Connect to Qdrant Cloud, server Qdrant, or embedded local Qdrant."""
+        """
+        Connect to Qdrant.
+
+        Priority:
+        1. Qdrant Cloud / QDRANT_URL
+        2. Qdrant server / host + port
+        3. Embedded local Qdrant fallback
+        """
 
         try:
-            # ---------------------------------------------------------
-            # Qdrant Cloud / URL-based connection
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
+            # Qdrant Cloud
+            # --------------------------------------------------------------
             if self.settings.qdrant_url:
                 client = QdrantClient(
                     url=self.settings.qdrant_url,
                     api_key=self.settings.qdrant_api_key or None,
-                    timeout=10,
+                    timeout=QDRANT_TIMEOUT_SECONDS,
                 )
 
                 target = self.settings.qdrant_url
 
-            # ---------------------------------------------------------
-            # Local/server Qdrant connection
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
+            # Qdrant server
+            # --------------------------------------------------------------
             else:
                 client = QdrantClient(
                     host=self.settings.qdrant_host,
                     port=self.settings.qdrant_port,
                     api_key=self.settings.qdrant_api_key or None,
-                    timeout=10,
+                    timeout=QDRANT_TIMEOUT_SECONDS,
                 )
 
                 target = (
@@ -78,32 +96,37 @@ class VectorStore:
                     f"{self.settings.qdrant_port}"
                 )
 
-            # Test connection.
+            # Test the connection.
             client.get_collections()
 
-            logger.info(f"Qdrant connected: {target}")
+            logger.info(
+                f"Qdrant connected successfully: {target}"
+            )
 
             return client
 
         except Exception as e:
-            # ---------------------------------------------------------
-            # IMPORTANT:
-            # If QDRANT_URL is configured, it means we expect a real
-            # production/cloud Qdrant instance.
-            #
-            # Do NOT silently fall back to local ephemeral storage.
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
+            # Production / Cloud
+            # --------------------------------------------------------------
+            # If QDRANT_URL is configured, we expect Qdrant Cloud.
+            # Do not silently fall back to local ephemeral storage.
+            # --------------------------------------------------------------
             if self.settings.qdrant_url:
+                logger.exception(
+                    f"Qdrant Cloud connection failed: {e}"
+                )
+
                 raise RuntimeError(
                     f"Could not connect to Qdrant Cloud: {e}"
                 ) from e
 
-            # ---------------------------------------------------------
-            # Local fallback
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
+            # Local development fallback
+            # --------------------------------------------------------------
             logger.warning(
-                "Qdrant server unavailable; "
-                f"using local mode. Error: {e}"
+                "Qdrant server unavailable. "
+                f"Switching to embedded local Qdrant. Error: {e}"
             )
 
             local_path = (
@@ -121,50 +144,69 @@ class VectorStore:
             )
 
             logger.info(
-                f"Qdrant LOCAL mode ON. Data: {local_path}"
+                f"Qdrant LOCAL mode enabled. "
+                f"Storage path: {local_path}"
             )
 
             return client
 
+    # ======================================================================
+    # Collection helpers
+    # ======================================================================
+
+    def _collection_exists(self) -> bool:
+        """Return True when the configured Qdrant collection exists."""
+
+        collections = self.client.get_collections().collections
+
+        return any(
+            collection.name == self.collection_name
+            for collection in collections
+        )
+
     def _init_collection(self) -> None:
-        """Check whether the configured collection already exists."""
+        """
+        Check whether the configured collection already exists.
+
+        Collection creation is delayed until the first document upload,
+        because we need the embedding dimension first.
+        """
 
         try:
-            collections = self.client.get_collections().collections
+            if not self._collection_exists():
+                logger.info(
+                    f"Collection '{self.collection_name}' "
+                    "does not exist yet. "
+                    "It will be created on the first upload."
+                )
+                return
 
-            exists = any(
-                collection.name == self.collection_name
-                for collection in collections
+            info = self.client.get_collection(
+                self.collection_name
             )
 
-            if exists:
-                info = self.client.get_collection(
-                    self.collection_name
-                )
+            vectors_config = info.config.params.vectors
 
-                self._dimension = (
-                    info.config.params.vectors.size
-                )
+            # Standard single-vector collection.
+            if hasattr(vectors_config, "size"):
+                self._dimension = vectors_config.size
 
-                logger.info(
-                    f"Collection '{self.collection_name}' ready "
-                    f"(dim={self._dimension}, "
-                    f"total_vectors={self.count})"
-                )
-
-            else:
-                logger.info(
-                    f"Collection '{self.collection_name}' nahi milli. "
-                    "Pehli upload pe ban jayegi."
-                )
+            logger.info(
+                f"Collection '{self.collection_name}' ready. "
+                f"dimension={self._dimension}, "
+                f"total_vectors={self.count}"
+            )
 
         except Exception as e:
             logger.warning(
-                f"Collection check failed: {e}"
+                f"Collection initialization check failed: {e}"
             )
 
-    def _create_collection(self, dimension: int) -> None:
-        """Create the Qdrant collection."""
+    def _create_collection(
+        self,
+        dimension: int,
+    ) -> None:
+        """Create a Qdrant collection with cosine similarity."""
 
         try:
             self.client.create_collection(
@@ -179,14 +221,18 @@ class VectorStore:
 
             logger.info(
                 f"Collection '{self.collection_name}' created "
-                f"(dim={dimension})"
+                f"with dimension={dimension}"
             )
 
         except Exception as e:
-            logger.error(
-                f"Collection create failed: {e}"
+            logger.exception(
+                f"Collection creation failed: {e}"
             )
             raise
+
+    # ======================================================================
+    # Upsert
+    # ======================================================================
 
     def upsert_chunks(
         self,
@@ -194,51 +240,86 @@ class VectorStore:
         embeddings: List[List[float]],
     ) -> None:
         """
-        Insert or update document chunks and their embeddings in Qdrant.
+        Upload document chunks and embeddings to Qdrant.
+
+        Large-document optimization:
+        Instead of building and sending hundreds/thousands of vectors
+        in one request, vectors are sent in batches.
+
+        This reduces:
+        - memory usage
+        - HTTP payload size
+        - Qdrant timeout risk
+        - failures with large PDFs
         """
 
-        if not chunks or not embeddings:
+        if not chunks:
+            logger.warning(
+                "upsert_chunks called with no chunks"
+            )
+            return
+
+        if not embeddings:
+            logger.warning(
+                "upsert_chunks called with no embeddings"
+            )
             return
 
         if len(chunks) != len(embeddings):
             raise ValueError(
-                f"chunks ({len(chunks)}) != "
-                f"embeddings ({len(embeddings)})"
+                f"Chunk/embedding count mismatch: "
+                f"chunks={len(chunks)}, "
+                f"embeddings={len(embeddings)}"
             )
 
         dimension = len(embeddings[0])
 
-        try:
-            collections = self.client.get_collections().collections
-
-            exists = any(
-                collection.name == self.collection_name
-                for collection in collections
+        if dimension <= 0:
+            raise ValueError(
+                "Embedding dimension cannot be zero"
             )
 
-            # ---------------------------------------------------------
-            # Create collection on first upload.
-            # ---------------------------------------------------------
-            if not exists:
-                self._create_collection(dimension)
+        try:
+            collection_exists = self._collection_exists()
 
-            # ---------------------------------------------------------
-            # Recreate collection if embedding dimension changed.
-            # Example:
-            # 1536 -> 3072
-            # ---------------------------------------------------------
-            elif (
+            # --------------------------------------------------------------
+            # First upload: create collection
+            # --------------------------------------------------------------
+            if not collection_exists:
+                self._create_collection(
+                    dimension
+                )
+
+            # --------------------------------------------------------------
+            # Ensure existing dimension is known
+            # --------------------------------------------------------------
+            elif self._dimension is None:
+                info = self.client.get_collection(
+                    self.collection_name
+                )
+
+                vectors_config = info.config.params.vectors
+
+                if hasattr(vectors_config, "size"):
+                    self._dimension = (
+                        vectors_config.size
+                    )
+
+            # --------------------------------------------------------------
+            # Embedding model dimension changed
+            # --------------------------------------------------------------
+            if (
                 self._dimension is not None
                 and dimension != self._dimension
             ):
                 logger.warning(
-                    "Dimension badal gayi "
-                    f"({self._dimension} -> {dimension}). "
-                    "Collection dobara bana raha hun."
+                    "Embedding dimension changed: "
+                    f"{self._dimension} -> {dimension}. "
+                    "Recreating Qdrant collection."
                 )
 
                 self.client.delete_collection(
-                    self.collection_name
+                    collection_name=self.collection_name
                 )
 
                 self._create_collection(
@@ -247,59 +328,112 @@ class VectorStore:
 
             self._dimension = dimension
 
-            points = []
-
-            for chunk, embedding in zip(chunks, embeddings):
-                if len(embedding) != dimension:
-                    raise ValueError(
-                        "Wrong dimension: "
-                        f"expected {dimension}, "
-                        f"got {len(embedding)}"
-                    )
-
-                # -----------------------------------------------------
-                # Qdrant point IDs must be valid UUIDs or integers.
-                #
-                # Therefore:
-                # - Generate a UUID for Qdrant's internal point ID.
-                # - Store the application's original chunk_id
-                #   inside the payload.
-                # -----------------------------------------------------
-                point = PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=embedding,
-                    payload={
-                        "chunk_id": chunk.chunk_id,
-                        "document_id": chunk.document_id,
-                        "document_name": chunk.document_name,
-                        "file_type": chunk.file_type,
-                        "page_number": chunk.page_number,
-                        "section": chunk.section,
-                        "text": chunk.text,
-                        "metadata": chunk.metadata,
-                    },
-                )
-
-                points.append(point)
-
-            # ---------------------------------------------------------
-            # Upload vectors to Qdrant.
-            # ---------------------------------------------------------
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points,
-                wait=True,
-            )
+            total_chunks = len(chunks)
 
             logger.info(
-                f"Upserted {len(points)} vectors to Qdrant"
+                f"Starting Qdrant upsert: "
+                f"{total_chunks} vectors, "
+                f"batch_size={QDRANT_BATCH_SIZE}"
+            )
+
+            # --------------------------------------------------------------
+            # Batch upload
+            # --------------------------------------------------------------
+            for start in range(
+                0,
+                total_chunks,
+                QDRANT_BATCH_SIZE,
+            ):
+                end = min(
+                    start + QDRANT_BATCH_SIZE,
+                    total_chunks,
+                )
+
+                batch_chunks = chunks[start:end]
+                batch_embeddings = embeddings[start:end]
+
+                points: List[PointStruct] = []
+
+                for chunk, embedding in zip(
+                    batch_chunks,
+                    batch_embeddings,
+                ):
+                    if len(embedding) != dimension:
+                        raise ValueError(
+                            "Wrong embedding dimension. "
+                            f"Expected {dimension}, "
+                            f"got {len(embedding)} "
+                            f"for chunk {chunk.chunk_id}"
+                        )
+
+                    point = PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=embedding,
+                        payload={
+                            "chunk_id": (
+                                chunk.chunk_id
+                            ),
+                            "document_id": (
+                                chunk.document_id
+                            ),
+                            "document_name": (
+                                chunk.document_name
+                            ),
+                            "file_type": (
+                                chunk.file_type
+                            ),
+                            "page_number": (
+                                chunk.page_number
+                            ),
+                            "section": (
+                                chunk.section
+                            ),
+                            "text": (
+                                chunk.text
+                            ),
+                            "metadata": (
+                                chunk.metadata
+                            ),
+                        },
+                    )
+
+                    points.append(point)
+
+                logger.info(
+                    f"Uploading Qdrant batch: "
+                    f"{start + 1}-{end}/"
+                    f"{total_chunks}"
+                )
+
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=points,
+                    wait=True,
+                )
+
+                logger.info(
+                    f"Qdrant progress: "
+                    f"{end}/{total_chunks} vectors uploaded"
+                )
+
+                # Release the temporary PointStruct objects
+                # before the next batch.
+                del points
+
+            logger.info(
+                f"Successfully upserted "
+                f"{total_chunks} vectors to Qdrant"
             )
 
         except Exception as e:
-            logger.error(
-                f"Upsert failed: {e}"
+            logger.exception(
+                f"Qdrant upsert failed: {e}"
             )
             raise
+
+    # ======================================================================
+    # Search
+    # ======================================================================
 
     def search(
         self,
@@ -308,43 +442,36 @@ class VectorStore:
         document_ids: Optional[List[str]] = None,
     ) -> List[DocumentChunk]:
         """
-        Search Qdrant for chunks similar to the query embedding.
+        Search Qdrant for document chunks similar to a query.
 
         Args:
             query_embedding:
-                Embedding vector generated from the user's query.
+                Query embedding vector.
 
             top_k:
-                Maximum number of vector results to return.
+                Maximum number of results.
 
             document_ids:
-                Optional list of document IDs.
-                If provided, search only inside those documents.
+                Optional document IDs to restrict search.
 
         Returns:
-            List of DocumentChunk objects ordered by similarity.
+            Document chunks ordered by vector similarity.
         """
 
         try:
-            collections = self.client.get_collections().collections
-
-            collection_exists = any(
-                collection.name == self.collection_name
-                for collection in collections
-            )
-
-            if not collection_exists:
+            if not self._collection_exists():
                 logger.warning(
                     f"Collection '{self.collection_name}' "
                     "does not exist"
                 )
+
                 return []
 
-            # ---------------------------------------------------------
-            # Optional document filtering
-            # ---------------------------------------------------------
             query_filter = None
 
+            # --------------------------------------------------------------
+            # Optional document filtering
+            # --------------------------------------------------------------
             if document_ids:
                 query_filter = Filter(
                     should=[
@@ -358,9 +485,16 @@ class VectorStore:
                     ]
                 )
 
-            # ---------------------------------------------------------
+            logger.info(
+                f"Searching Qdrant: "
+                f"top_k={top_k}, "
+                f"document_filter="
+                f"{bool(document_ids)}"
+            )
+
+            # --------------------------------------------------------------
             # Modern Qdrant query API
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
             response = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_embedding,
@@ -373,11 +507,14 @@ class VectorStore:
 
             chunks: List[DocumentChunk] = []
 
-            # ---------------------------------------------------------
-            # Convert Qdrant results back into DocumentChunk objects.
-            # ---------------------------------------------------------
+            # --------------------------------------------------------------
+            # Convert Qdrant points to application DocumentChunk objects
+            # --------------------------------------------------------------
             for scored_point in results:
-                payload = scored_point.payload or {}
+                payload = (
+                    scored_point.payload
+                    or {}
+                )
 
                 chunk = DocumentChunk(
                     chunk_id=payload.get(
@@ -429,9 +566,9 @@ class VectorStore:
 
             if chunks:
                 logger.info(
-                    "Top result: "
-                    f"{chunks[0].document_name} "
-                    f"(score={chunks[0].score:.3f})"
+                    "Top Qdrant result: "
+                    f"{chunks[0].document_name}, "
+                    f"score={chunks[0].score:.3f}"
                 )
 
             return chunks
@@ -440,72 +577,78 @@ class VectorStore:
             logger.exception(
                 f"Qdrant search failed: {e}"
             )
+
             return []
+
+    # ======================================================================
+    # Delete document vectors
+    # ======================================================================
 
     def delete_by_document(
         self,
         document_id: str,
     ) -> int:
         """
-        Delete all vectors belonging to a specific document.
+        Delete every vector belonging to one document.
 
         Returns:
-            1 if deletion request was performed.
-            0 if collection does not exist or deletion failed.
+            1 when deletion was performed.
+            0 when collection does not exist or deletion failed.
         """
 
         try:
-            collections = self.client.get_collections().collections
+            if not self._collection_exists():
+                logger.warning(
+                    "Cannot delete document vectors: "
+                    "collection does not exist"
+                )
 
-            collection_exists = any(
-                collection.name == self.collection_name
-                for collection in collections
-            )
-
-            if not collection_exists:
                 return 0
+
+            document_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(
+                            value=document_id
+                        ),
+                    )
+                ]
+            )
 
             self.client.delete(
                 collection_name=self.collection_name,
-                points_selector=Filter(
-                    must=[
-                        FieldCondition(
-                            key="document_id",
-                            match=MatchValue(
-                                value=document_id
-                            ),
-                        )
-                    ]
+                points_selector=FilterSelector(
+                    filter=document_filter
                 ),
                 wait=True,
             )
 
             logger.info(
-                f"Deleted vectors for document {document_id}"
+                f"Deleted Qdrant vectors for "
+                f"document {document_id}"
             )
 
             return 1
 
         except Exception as e:
-            logger.error(
-                f"Delete failed: {e}"
+            logger.exception(
+                f"Qdrant document deletion failed: {e}"
             )
+
             return 0
 
+    # ======================================================================
+    # Clear collection
+    # ======================================================================
+
     def clear(self) -> None:
-        """Delete the entire Qdrant collection."""
+        """Delete the complete Qdrant collection."""
 
         try:
-            collections = self.client.get_collections().collections
-
-            collection_exists = any(
-                collection.name == self.collection_name
-                for collection in collections
-            )
-
-            if collection_exists:
+            if self._collection_exists():
                 self.client.delete_collection(
-                    self.collection_name
+                    collection_name=self.collection_name
                 )
 
                 logger.info(
@@ -516,47 +659,46 @@ class VectorStore:
             self._dimension = None
 
         except Exception as e:
-            logger.error(
-                f"Clear failed: {e}"
+            logger.exception(
+                f"Qdrant clear failed: {e}"
             )
+
+    # ======================================================================
+    # Properties
+    # ======================================================================
 
     @property
     def dimension(self) -> Optional[int]:
-        """Return the current embedding dimension."""
+        """Return the active embedding dimension."""
 
         return self._dimension
 
     @property
     def count(self) -> int:
-        """Return the number of vectors in the collection."""
+        """Return total number of vectors in the collection."""
 
         try:
-            collections = self.client.get_collections().collections
-
-            collection_exists = any(
-                collection.name == self.collection_name
-                for collection in collections
-            )
-
-            if not collection_exists:
+            if not self._collection_exists():
                 return 0
 
             result = self.client.count(
-                collection_name=self.collection_name
+                collection_name=self.collection_name,
+                exact=True,
             )
 
             return result.count
 
         except Exception as e:
             logger.warning(
-                f"Count failed: {e}"
+                f"Qdrant count failed: {e}"
             )
+
             return 0
 
 
-# -------------------------------------------------------------------------
-# Singleton VectorStore instance
-# -------------------------------------------------------------------------
+# ==========================================================================
+# Singleton
+# ==========================================================================
 
 _vector_store: Optional[VectorStore] = None
 
