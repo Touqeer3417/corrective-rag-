@@ -28,6 +28,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         loading: false,
       });
     } catch (e) {
+      console.error('Failed to fetch documents:', e);
       set({ loading: false });
     }
   },
