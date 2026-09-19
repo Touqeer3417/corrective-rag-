@@ -4,9 +4,8 @@ import { DocumentInfo } from '../types/document';
 export async function uploadDocument(file: File) {
   const formData = new FormData();
   formData.append('file', file);
-  const res = await api.post('/documents/upload', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
+    const res = await api.post('/documents/upload', formData);
+
   return res.data;
 }
 
