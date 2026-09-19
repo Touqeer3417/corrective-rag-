@@ -10,13 +10,19 @@ from rank_bm25 import BM25Okapi
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.schemas.document import DocumentChunk
-
+import re 
 logger = get_logger("retrieval.sparse")
 
 
 def tokenize(text: str) -> List[str]:
-    """Simple whitespace tokenization with lowercase."""
-    return text.lower().split()
+    """
+    Normalize text for BM25 retrieval.
+
+    Removes punctuation so:
+    'supervisor?' and 'supervisor'
+    are treated as the same token.
+    """
+    return re.findall(r"\b[a-zA-Z0-9]+\b", text.lower())
 
 
 class BM25Index:
