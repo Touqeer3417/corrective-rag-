@@ -9,7 +9,7 @@ export default function ChatPage() {
   const [citations, setCitations] = useState<Citation[]>([]);
   const [loading, setLoading] = useState(false);
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
-  const [metadata, setMetadata] = useState<{ retry_count?: number; transformed_query?: string }>({});
+  const [, setMetadata] = useState<{ retry_count?: number; transformed_query?: string }>({});
   const [isTyping, setIsTyping] = useState(false);
   const [responseTime, setResponseTime] = useState<number | null>(null);
   const abortRef = useRef<(() => void) | null>(null);
